@@ -19,6 +19,9 @@
     ItemRemoved and ItemAdded are the same contract wise
     An optimization would be to just have an SlotExecuted with the slot and the enum
     So there are no branches figuring out which one, and it's slightly cheaper to deploy.
+    
+    put an option to manually call the function to calculate juror fees and store it locally
+    instead of calling an expensive function over contracts every time
 
 */
 
@@ -29,6 +32,11 @@ contract SlotCurate {
         Removal
     }
     
+    enum Party {
+        Requester,
+        Challenger
+    }
+    
     // you can compress the bools / enums into a byte variable.
     // that + uint32 timestamp, means there are 7 vacant bytes per slot.
     // but we only need to know the slot to identify the dispute, so why bother?
@@ -37,36 +45,56 @@ contract SlotCurate {
         bool used;
         ProcessType processType;
         bool beingDisputed;
-        uint72 submissionTime;
+        uint72 requestTime;
         address requester;
     }
     
+    // all bounded data related to the Dispute. unbounded data such as contributions is handled out
     struct Dispute {
-        uint32 slot; // could be adjusted, because its massive.
-        uint todo;
+        uint256 disputeId; // there's no way around this
+        uint32 slot; // flexible
+        uint32 nContributions; // flexible
+        
+    }
+    
+    /* it's pretty tight. we want 256 bits per Contribution, but address only leaves
+    // 96 bits for amount + data
+    // if we want to split contributions based on rounds
+    // 1. if rounds increase exponentially, then a uint8 to encode round + party is enough.
+    // Still, the main problem is that it doesn't leave much for amount
+    // current ETH can be counted with 87 bits. uint88 will top any amount of ETH for a long time.
+    // uint80 is not acceptable. (will be like this temporarily until I change it)
+    // you could also encode everything in the 96 remaining bits, and take,
+    // 1 bit for Party, ~6 for round, and give an extra bit to the amount?
+    */
+    struct Contribution {
+        uint8 round;
+        Party party;
+        uint80 amount;
+        address contributor;
     }
     
     // EVENTS //
     
     event ItemAddRequest(uint _slotIndex, string _ipfsUri);
     event ItemAdded(uint _slotIndex);
-    event ItemRemovalRequest(uint _workSlot, uint _idSlot, uint _idSubmissionTime);
+    event ItemRemovalRequest(uint _workSlot, uint _idSlot, uint _idRequestTime);
     event ItemRemoved(uint _slotIndex);
     
     
     // CONTRACT STORAGE //
     // these cannot be changed after deployment.
-    string rulesIpfs;
-    uint submissionPeriod;
-    uint requesterStake;
-    uint challengerStake;
+    // might actually become changable? but only if there's enough space available in the slots
+    uint immutable requestPeriod;
+    uint immutable requesterStake;
+    uint immutable challengerStake;
     
     mapping(uint256 => Slot) slots;
     mapping(uint256 => Dispute) disputes;
+    mapping(uint256 => mapping(uint256 => Contribution)) contributions; // contributions[disputeSlot][n]
     
-    constructor(string memory _rulesIpfs, uint _submissionPeriod, uint _requesterStake, uint _challengerStake) {
-        rulesIpfs = _rulesIpfs;
-        submissionPeriod = _submissionPeriod;
+    constructor(uint _requestPeriod, uint _requesterStake, uint _challengerStake) {
+        requestPeriod = _requestPeriod;
         requesterStake = _requesterStake;
         challengerStake = _challengerStake;
     }
@@ -81,21 +109,21 @@ contract SlotCurate {
         slot.used = true;
         slot.processType = ProcessType.Add;
         slot.beingDisputed = false;
-        slot.submissionTime = uint72(block.timestamp);
+        slot.requestTime = uint72(block.timestamp);
         slot.requester = msg.sender;
         emit ItemAddRequest(_slotIndex, _ipfsUri);
     }
     
-    function removeItem(uint _workSlot, uint _idSlot, uint _idSubmissionTime) public payable {
+    function removeItem(uint _workSlot, uint _idSlot, uint _idRequestTime) public payable {
         Slot storage slot = slots[_workSlot];
         require(slot.used == false, "Slot must not be in use");
         require(msg.value >= requesterStake, "This is not enough to cover initial stake");
         slot.used = true;
         slot.processType = ProcessType.Removal;
         slot.beingDisputed = false;
-        slot.submissionTime = uint72(block.timestamp);
+        slot.requestTime = uint72(block.timestamp);
         slot.requester = msg.sender;
-        emit ItemRemovalRequest(_workSlot, _idSlot, _idSubmissionTime);
+        emit ItemRemovalRequest(_workSlot, _idSlot, _idRequestTime);
     }
     
     function executeRequest(uint _slotIndex) public {
@@ -156,7 +184,12 @@ contract SlotCurate {
     }
     
     function slotIsExecutable(Slot memory _slot) view public returns (bool) {
-        bool overSubmissionPeriod = block.timestamp > _slot.submissionTime + submissionPeriod;
-        return _slot.used && overSubmissionPeriod && !_slot.beingDisputed;
+        bool overRequestPeriod = block.timestamp > _slot.requestTime + requestPeriod;
+        return _slot.used && overRequestPeriod && !_slot.beingDisputed;
+    }
+    
+    function slotCanBeChallenged(Slot memory _slot) view public returns (bool) {
+        bool overRequestPeriod = block.timestamp > _slot.requestTime + requestPeriod;
+        return _slot.used && !overRequestPeriod && !_slot.beingDisputed;
     }
 }

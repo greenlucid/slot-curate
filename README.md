@@ -3,6 +3,7 @@ I will do frequent commits to make sure I don't go around losing history again.
 Thankfully not much was lost. I remember most of the changes and I've kept track of the important stuff with my notes.
 
 This repo is intended for archival, not usage of any kind!
+Contract may be filled with unprofessional notes. Will attempt to get the "proper" solidity comment style later, but for now I just want to get it done.
 
 # Slot Curate
 
