@@ -22,6 +22,18 @@
     
     put an option to manually call the function to calculate juror fees and store it locally
     instead of calling an expensive function over contracts every time
+    
+    in next version with lists etc you could assign ids to "packs"
+    "packs" are sets of arbitration data,, msubmissionTime, whatever.
+    so you could have many in the same contracts
+    anyoen can create packs
+    
+    put the most used functions (add, remove item) as first functions because that
+    makes it cheaper
+    
+    it is my moral obligation to use uint ipfsHash instead of string. it saves so much gas.
+    now it costs 30k.
+    
 
 */
 
@@ -37,19 +49,41 @@ contract SlotCurate {
         Challenger
     }
     
+    struct ListSettings {
+        uint requestPeriod;
+        uint requesterStake;
+        uint challengerStake;
+        //  store arbitrator?
+        //  store extraData?!?!
+    }
+    
+    struct List {
+        uint32 settingsId;
+        address governor; // governors can change governor of the list, and change settingsId
+        uint64 freeSpace;
+    }
+    
     // you can compress the bools / enums into a byte variable.
     // that + uint32 timestamp, means there are 7 vacant bytes per slot.
     // but we only need to know the slot to identify the dispute, so why bother?
     // if ids turn out to be needed, that's fine, there's enough space.
+    // update:
+    // because in new version we store settingsId in the Slot... hmm
+    // lets encode settings with uint32 to make attacks unfeasible.
+    // you have to store settingsId to stop ongoing Slot to change the settings
+    // so there are 2 free bytes right now.
+    
     struct Slot {
         bool used;
         ProcessType processType;
         bool beingDisputed;
-        uint72 requestTime;
+        uint32 settingsId;
+        uint40 requestTime; // overflow in 37k years
         address requester;
     }
     
     // all bounded data related to the Dispute. unbounded data such as contributions is handled out
+    // todo
     struct Dispute {
         uint256 disputeId; // there's no way around this
         uint32 slot; // flexible
@@ -66,17 +100,21 @@ contract SlotCurate {
     // uint80 is not acceptable. (will be like this temporarily until I change it)
     // you could also encode everything in the 96 remaining bits, and take,
     // 1 bit for Party, ~6 for round, and give an extra bit to the amount?
+        you could also not store round at all, and distribute rewards
+        proportionally disregarding rounds.
+    // actually, just raise everything something like 16 bits so you have to store 16 less bits.
+    // who cares about digital dust am i right
     */
     struct Contribution {
         uint8 round;
         Party party;
-        uint80 amount;
+        uint80 amount; // to be raised 16 bits.
         address contributor;
     }
     
     // EVENTS //
     
-    event ItemAddRequest(uint _slotIndex, string _ipfsUri);
+    event ItemAddRequest(uint _slotIndex, uint _ipfsUri);
     event ItemAdded(uint _slotIndex);
     event ItemRemovalRequest(uint _workSlot, uint _idSlot, uint _idRequestTime);
     event ItemRemoved(uint _slotIndex);
@@ -91,6 +129,7 @@ contract SlotCurate {
     
     mapping(uint256 => Slot) slots;
     mapping(uint256 => Dispute) disputes;
+    mapping(uint32 => ListSettings) listSettings; // encoded with uint32 to make an attack unfeasible
     mapping(uint256 => mapping(uint256 => Contribution)) contributions; // contributions[disputeSlot][n]
     
     constructor(uint _requestPeriod, uint _requesterStake, uint _challengerStake) {
@@ -101,15 +140,17 @@ contract SlotCurate {
     
     // PUBLIC FUNCTIONS
     
+    // lists
+    
     // no refunds for overpaying. consider it burned. refunds are bloat.
-    function addItem(uint _slotIndex, string memory _ipfsUri) public payable {
+    function addItem(uint _slotIndex, uint _ipfsUri) public payable {
         Slot storage slot = slots[_slotIndex];
         require(slot.used == false, "Slot must not be in use");
         require(msg.value >= requesterStake, "This is not enough to cover initial stake");
         slot.used = true;
         slot.processType = ProcessType.Add;
         slot.beingDisputed = false;
-        slot.requestTime = uint72(block.timestamp);
+        slot.requestTime = uint40(block.timestamp);
         slot.requester = msg.sender;
         emit ItemAddRequest(_slotIndex, _ipfsUri);
     }
@@ -121,7 +162,7 @@ contract SlotCurate {
         slot.used = true;
         slot.processType = ProcessType.Removal;
         slot.beingDisputed = false;
-        slot.requestTime = uint72(block.timestamp);
+        slot.requestTime = uint40(block.timestamp);
         slot.requester = msg.sender;
         emit ItemRemovalRequest(_workSlot, _idSlot, _idRequestTime);
     }
