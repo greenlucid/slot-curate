@@ -102,7 +102,8 @@ contract SlotCurate {
     // todo
     struct Dispute {
         uint256 arbitratorDisputeId; // there's no way around this
-        uint64 slot; // flexible
+        bool used;
+        uint64 slotId; // flexible
         uint32 nContributions; // flexible
     }
     
@@ -129,7 +130,7 @@ contract SlotCurate {
     uint32 settingsCount; // to prevent from assigning invalid settings to lists.
 
     mapping(uint64 => Slot) slots;
-    mapping(uint256 => Dispute) disputes;
+    mapping(uint64 => Dispute) disputes;
     mapping(uint64 => List) lists;
     mapping(uint32 => Settings) settingsMap; // encoded with uint32 to make an attack unfeasible
     mapping(uint256 => mapping(uint256 => Contribution)) contributions; // contributions[disputeSlot][n]
@@ -160,7 +161,7 @@ contract SlotCurate {
     // bit of a draft since I havent done the dispute side of things yet
     function createSettings(uint _requestPeriod, uint _requesterStake, uint _challengerStake) public {
         // put safeguard check? for checking if settingsCount is -1.
-        require(settingsCount != 4294967295, "Max settings reached"); // there are 4.3B so please just reuse one
+        require(settingsCount != 4294967295, "Max settings reached"); // there'd be 4.3B so please just reuse one
         Settings storage settings = settingsMap[settingsCount++];
         settings.requestPeriod = _requestPeriod;
         settings.requesterStake = _requesterStake;
@@ -175,6 +176,8 @@ contract SlotCurate {
     // otherwise, the transaction fails. it's important to have it optional this since there could potentially be a lot of
     // taken slots.
     // but its important to have to option as safeguard in case frontrunners try to inhibit the protocol.
+    // another way is making a separate wrapper public function for this, that calls the two main ones
+    // (make one for add and another for remove. and another one for challenging (to get free dispute slot))
 
     // in the contract, listIndex and settingsId are trusted.
     // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
@@ -201,7 +204,7 @@ contract SlotCurate {
         Slot storage slot = slots[_workSlot];
         require(slot.used == false, "Slot must not be in use");
         Settings storage settings = settingsMap[_settingsId];
-        require(msg.value >= settings.requesterStake, "This is not enough to cover initial stake");
+        require(msg.value >= settings.requesterStake, "This is not enough to cover requester stake");
         slot.settingsId = _settingsId;
         slot.used = true;
         slot.processType = ProcessType.Removal;
@@ -225,6 +228,43 @@ contract SlotCurate {
             emit ItemRemoved(_slotIndex);
         }
     }
+
+    function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
+        Slot storage slot = slots[_slotIndex];
+        require(slotCanBeChallenged(slot), "Slot cannot be challenged");
+        Settings storage settings = settingsMap[slot.settingsId];
+        require(msg.value >= settings.challengerStake, "This is not enough to cover challenger stake");
+        Dispute storage dispute = disputes[_disputeSlot];
+        require(!dispute.used, "That dispute slot is being used");
+
+        slot.beingDisputed = true;
+        // it will be challenged now
+
+        // arbitrator magic happens here (pay fees, maybe read how much juror fees are...)
+        // and get disputeId so that you can store it, you know.
+
+        dispute.used = true;
+        dispute.nContributions = 1; // storing requester is a waste. just compute it separately
+        dispute.slotId = _slotIndex;
+    }
+
+    // rule:
+    /*
+        because disputeId is stored in the dispute slots,
+        but rule doesn't know in which dispute slot it is stored, 
+        there are 2 ways to go about this:
+        
+        the O(n) way: just read all disputes until you find
+        disputeId == _disputeId
+        and execute the action there.
+        could be cheaper, but cost grows as the number of slots grows
+        (and might be subject to attack)
+
+        the storage way: store the ruling in Rulings[disputeId], along with a timestamp.
+        and just have another func "executeRuling" separately, on the dispute. the dispute slot know the disputeId,
+        but the disputeId doesn't know the dispute slot.
+        has a fixed cost of ~45k, such is life.
+    */
     
     
     // VIEW FUNCTIONS
