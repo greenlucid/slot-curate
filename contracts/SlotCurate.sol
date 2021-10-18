@@ -33,6 +33,30 @@
     4B of settings at 150k per creation can hold 17 years of having all blocks fully creating settings.
     with so much time and so many settings, maybe there's a few useful ones?
 
+    // adding the list requires made it SUPER expensive.
+    // now it's 38k to add item. not acceptable.
+    // what ill do instead is, just verify it on the subgraph instead.
+    // if user posts list that doesn't exist, or posts settings that are not the current settings of that list
+    // then subgraph will act as if item didn't exist. or, maybe track it but as an invalid item.
+    // this means, now you have to submit the settings in the args...?
+    // maybe instead submit list, do the extra read but don't do require.
+    yup. that removed 4k cost, just like that.
+    now 50.6k to create initially, and 33545 in used slot.
+    if settings not in args, 52.4k initially and 35186 in used slot.
+    changing the order: 52286, 
+    AND means you can do it by only verifying list exists in subgraph.
+    and i wasn't even verifying minimum stake... yeah seems like it's up to 35.4k again.
+
+    ideas for the future:
+    not even store all data to verify the process on chain. you could let invalid process on chain
+    just exist and finish, and ignore them.
+    you could even not store the lists logic at all, make them just be another item submission, somehow.
+    again, the terms will be stored off chain, so whoever doesn't play by the rules is just ignored
+    and you let their process exist and do whatever.
+
+    maybe, do the same thing I'm doing but put some assembly level optimizations
+    since I can tell the compiler is messing up the order of the calls and wasting gas.
+    would make it hard to audit.
 */
 
 contract SlotCurate {
@@ -49,7 +73,7 @@ contract SlotCurate {
     
     // settings cannot be mutated once created
     struct Settings {
-        // you don't need to store created, because 
+        // you don't need to store created
         uint requestPeriod;
         uint requesterStake;
         uint challengerStake;
@@ -58,11 +82,9 @@ contract SlotCurate {
     }
     
     struct List {
-        bool created; // needed so that no one submits items for uncreated lists.
-        // why not check with listCount? because it'd be one extra storage read (100 gas)
         uint32 settingsId;
         address governor; // governors can change governor of the list, and change settingsId
-        uint56 freeSpace;
+        uint64 freeSpace;
     }
     
     // if you compress bools and enum into 1 byte
@@ -98,7 +120,7 @@ contract SlotCurate {
     event SettingsCreated(uint _requestPeriod, uint _requesterStake, uint _challengerStake);
     event ItemAddRequest(uint64 _listIndex, uint64 _slotIndex, string _ipfsUri);
     event ItemAdded(uint64 _slotIndex);
-    event ItemRemovalRequest(uint64 _workSlot, uint64 _idSlot, uint40 _idRequestTime);
+    event ItemRemovalRequest(uint64 _workSlot, uint32 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
     event ItemRemoved(uint64 _slotIndex);
     
     
@@ -121,7 +143,6 @@ contract SlotCurate {
     function createList(address _governor, uint32 _settingsId, string memory _ipfsUri) public {
         require(_settingsId < settingsCount, "Settings must exist");
         List storage list = lists[listCount++];
-        list.created = true;
         list.governor = _governor;
         list.settingsId = _settingsId;
         emit ListCreated(listCount - 1, _settingsId, _governor, _ipfsUri);
@@ -154,15 +175,17 @@ contract SlotCurate {
     // otherwise, the transaction fails. it's important to have it optional this since there could potentially be a lot of
     // taken slots.
     // but its important to have to option as safeguard in case frontrunners try to inhibit the protocol.
-    function addItem(uint64 _listIndex, uint64 _slotIndex, string memory _ipfsUri) public payable {
+
+    // in the contract, listIndex and settingsId are trusted.
+    // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
+    // then item will be ignored or marked as invalid.
+    function addItem(uint64 _listIndex, uint32 _settingsId, uint64 _slotIndex, string memory _ipfsUri) public payable {
         Slot storage slot = slots[_slotIndex];
         require(slot.used == false, "Slot must not be in use");
-        List storage list = lists[_listIndex];
-        require(list.created, "List must have been created");
-        Settings storage settings = settingsMap[list.settingsId];
-        require(msg.value >= settings.requesterStake, "This is not enough to cover initial stake");
+        Settings storage settings = settingsMap[_settingsId];
+        require(msg.value >= settings.requesterStake, "This is not enough to cover initil stake");
+        slot.settingsId = _settingsId;
         slot.used = true;
-        slot.settingsId = list.settingsId;
         slot.processType = ProcessType.Add;
         slot.beingDisputed = false;
         slot.requestTime = uint40(block.timestamp);
@@ -170,20 +193,22 @@ contract SlotCurate {
         emit ItemAddRequest(_listIndex, _slotIndex, _ipfsUri);
     }
     
-    function removeItem(uint64 _workSlot, uint64 _listIndex, uint64 _idSlot, uint40 _idRequestTime) public payable {
+    // list is checked in subgraph. settings is trusted here.
+    // if settings was not the one settings in subgraph at the time,
+    // then subgraph will ignore the removal (so it has no effect when exec.)
+    // could even be challenged as an ilegal request to extract the stake, if significant.
+    function removeItem(uint64 _workSlot, uint32 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
         Slot storage slot = slots[_workSlot];
         require(slot.used == false, "Slot must not be in use");
-        List storage list = lists[_listIndex];
-        require(list.created, "List must have been created");
-        Settings storage settings = settingsMap[list.settingsId];
+        Settings storage settings = settingsMap[_settingsId];
         require(msg.value >= settings.requesterStake, "This is not enough to cover initial stake");
+        slot.settingsId = _settingsId;
         slot.used = true;
-        slot.settingsId = list.settingsId;
         slot.processType = ProcessType.Removal;
         slot.beingDisputed = false;
         slot.requestTime = uint40(block.timestamp);
         slot.requester = msg.sender;
-        emit ItemRemovalRequest(_workSlot, _idSlot, _idRequestTime);
+        emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
     }
     
     function executeRequest(uint64 _slotIndex) public {
@@ -204,7 +229,7 @@ contract SlotCurate {
     
     // VIEW FUNCTIONS
     
-    // relying on this on active contracts could result on users colliding on same slot
+    // relying on this by itself could result on users colliding on same slot
     // user which is late will have the transaction cancelled, but gas wasted and unhappy ux
     // could be used to make an "emergency slot", in case your slot submission was in an used slot.
     // will get the first Virgin, or Created slot.
