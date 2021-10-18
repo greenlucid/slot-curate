@@ -15,6 +15,7 @@
     ItemRemoved and ItemAdded are the same contract wise
     An optimization would be to just have an SlotExecuted with the slot and the enum
     So there are no branches figuring out which one, and it's slightly cheaper to deploy.
+    maybe not. the only way to tell is to go and actually try it.
     
     put an option to manually call the function to calculate juror fees and store it locally
     instead of calling an expensive function over contracts every time
@@ -46,7 +47,9 @@ contract SlotCurate {
         Challenger
     }
     
+    // settings cannot be mutated once created
     struct Settings {
+        // you don't need to store created, because 
         uint requestPeriod;
         uint requesterStake;
         uint challengerStake;
@@ -55,7 +58,8 @@ contract SlotCurate {
     }
     
     struct List {
-        bool created;
+        bool created; // needed so that no one submits items for uncreated lists.
+        // why not check with listCount? because it'd be one extra storage read (100 gas)
         uint32 settingsId;
         address governor; // governors can change governor of the list, and change settingsId
         uint56 freeSpace;
@@ -75,7 +79,7 @@ contract SlotCurate {
     // all bounded data related to the Dispute. unbounded data such as contributions is handled out
     // todo
     struct Dispute {
-        uint256 disputeId; // there's no way around this
+        uint256 arbitratorDisputeId; // there's no way around this
         uint64 slot; // flexible
         uint32 nContributions; // flexible
     }
@@ -89,10 +93,13 @@ contract SlotCurate {
     
     // EVENTS //
     
-    event ItemAddRequest(uint _slotIndex, string _ipfsUri);
-    event ItemAdded(uint _slotIndex);
-    event ItemRemovalRequest(uint _workSlot, uint _idSlot, uint _idRequestTime);
-    event ItemRemoved(uint _slotIndex);
+    event ListCreated(uint64 _listIndex, uint32 _settingsId, address _governor, string _ipfsUri);
+    event ListUpdated(uint64 _listIndex, uint32 _settingsId, address _governor);
+    event SettingsCreated(uint _requestPeriod, uint _requesterStake, uint _challengerStake);
+    event ItemAddRequest(uint64 _listIndex, uint64 _slotIndex, string _ipfsUri);
+    event ItemAdded(uint64 _slotIndex);
+    event ItemRemovalRequest(uint64 _workSlot, uint64 _idSlot, uint40 _idRequestTime);
+    event ItemRemoved(uint64 _slotIndex);
     
     
     // CONTRACT STORAGE //
@@ -111,8 +118,42 @@ contract SlotCurate {
     // PUBLIC FUNCTIONS
     
     // lists
+    function createList(address _governor, uint32 _settingsId, string memory _ipfsUri) public {
+        require(_settingsId < settingsCount, "Settings must exist");
+        List storage list = lists[listCount++];
+        list.created = true;
+        list.governor = _governor;
+        list.settingsId = _settingsId;
+        emit ListCreated(listCount - 1, _settingsId, _governor, _ipfsUri);
+    }
+
+    function updateList(uint64 _listIndex, uint32 _settingsId, address _newGovernor) public {
+        List storage list = lists[_listIndex];
+        require(msg.sender == list.governor, "You need to be the governor");
+        list.governor = _newGovernor;
+        list.settingsId = _settingsId;
+        emit ListUpdated(_listIndex, _settingsId, _newGovernor);
+    }
+
+    // settings
+    // bit of a draft since I havent done the dispute side of things yet
+    function createSettings(uint _requestPeriod, uint _requesterStake, uint _challengerStake) public {
+        // put safeguard check? for checking if settingsCount is -1.
+        require(settingsCount != 4294967295, "Max settings reached"); // there are 4.3B so please just reuse one
+        Settings storage settings = settingsMap[settingsCount++];
+        settings.requestPeriod = _requestPeriod;
+        settings.requesterStake = _requesterStake;
+        settings.challengerStake = _challengerStake;
+        emit SettingsCreated(_requestPeriod, _requesterStake, _challengerStake);
+    }
     
     // no refunds for overpaying. consider it burned. refunds are bloat.
+
+    // you could add an "emergency" boolean option.
+    // if on, and the chosen slotIndex is taken, it will look for the first unused slot and create there instead.
+    // otherwise, the transaction fails. it's important to have it optional this since there could potentially be a lot of
+    // taken slots.
+    // but its important to have to option as safeguard in case frontrunners try to inhibit the protocol.
     function addItem(uint64 _listIndex, uint64 _slotIndex, string memory _ipfsUri) public payable {
         Slot storage slot = slots[_slotIndex];
         require(slot.used == false, "Slot must not be in use");
@@ -126,10 +167,10 @@ contract SlotCurate {
         slot.beingDisputed = false;
         slot.requestTime = uint40(block.timestamp);
         slot.requester = msg.sender;
-        emit ItemAddRequest(_slotIndex, _ipfsUri);
+        emit ItemAddRequest(_listIndex, _slotIndex, _ipfsUri);
     }
     
-    function removeItem(uint64 _workSlot, uint64 _listIndex, uint _idSlot, uint _idRequestTime) public payable {
+    function removeItem(uint64 _workSlot, uint64 _listIndex, uint64 _idSlot, uint40 _idRequestTime) public payable {
         Slot storage slot = slots[_workSlot];
         require(slot.used == false, "Slot must not be in use");
         List storage list = lists[_listIndex];
@@ -165,8 +206,10 @@ contract SlotCurate {
     
     // relying on this on active contracts could result on users colliding on same slot
     // user which is late will have the transaction cancelled, but gas wasted and unhappy ux
-    function firstFreeSlot() view public returns (uint) {
-        uint64 i = 0;
+    // could be used to make an "emergency slot", in case your slot submission was in an used slot.
+    // will get the first Virgin, or Created slot.
+    function firstFreeSlot(uint64 _startPoint) view public returns (uint64) {
+        uint64 i = _startPoint;
         while (slots[i].used) {
             i = i + 1;
         }
@@ -176,8 +219,8 @@ contract SlotCurate {
     // debugging purposes, for now. shouldn't be too expensive and could be useful in future, tho
     // doesn't actually "count" the slots, just checks until there's a virgin slot
     // it's the same as "maxSlots" in the notes
-    function firstVirginSlot() view public returns (uint) {
-        uint64 i = 0;
+    function firstVirginSlotFrom(uint64 _startPoint) view public returns (uint64) {
+        uint64 i = _startPoint;
         while (slots[i].requester != address(0)){
             i = i + 1;
         }
@@ -185,11 +228,11 @@ contract SlotCurate {
     }
     
     // this is prob bloat. based on the idea of generating a random free slot, to avoid collisions.
-    // could be used to advice the users to swait until there's free slot for gas savings.
-    function countFreeSlots() view public returns (uint) {
-        uint slotCount = firstVirginSlot();
+    // could be used to advice the users to wait until there's free slot for gas savings.
+    function countFreeSlots() view public returns (uint64) {
+        uint64 slotCount = firstVirginSlotFrom(0);
         uint64 i = 0;
-        uint freeSlots = 0;
+        uint64 freeSlots = 0;
         for (; i < slotCount; i++) {
             Slot storage slot = slots[i];
             if (!slot.used) {
