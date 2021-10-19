@@ -341,6 +341,45 @@ contract SlotCurate {
         emit ItemAdded(uint64(actualAmount));
     }
 
+    function executeRuling(uint64 _disputeSlot) public {
+        /*
+            I want to rethink how to do this.
+            is it "executeRuling" or "withdrawFeesAndRewards"
+            you should withdrawFeesAndRewards the moment you execute the dispute
+            otherwise something could overwrite the contributions before they are cashed out.
+            so "executeRuling" and "withdrawFeesAndRewards" are kind of the same.
+
+            ok, but that's not the issue. the issue is that the cashout bool made sense.
+            but it's not how it really works.
+            what actually happens is that arbitrator sets the ruling.
+            then you call the function to execute the ruling.
+            there's a problem with how the rule func works right now
+            it only allows for one single arbitrator to be able to write to ALL lists.
+
+            let me explain...
+            the problem "rule" was trying to solve is that, because disputes can be in any slot,
+            instead of searching for the one, just write to a mapping.
+            but, that mapping doesn't know if that arbitrator is allowed to write to that mapping,
+            actually.
+            you could make that easily happen:
+            just make a first storage write on that mapping for that disputeId when challenging.
+            and write the arbitrator there.
+            so, when rule is called, arbitrator will check if he's allowed to write on the mapping.
+            this'd make challenging 20k more expensive per challenge and allows to use different arbitrators.
+            why cannot (shouldnt) rule be called without this aid, because looking for dispute slot has worst case O(n)
+            so attacker could create enough disputes to reach gas limit and stop rule from happening.
+
+        */
+        require(canCashoutContributions(_disputeSlot), "You cannot cash out this dispute");
+        // now we cash out the dispute
+        // round 0
+        // the amount to withdraw is made up.
+
+
+        // nvm redo this.
+
+    }
+
     // rule:
     /*
         because disputeId is stored in the dispute slots,
@@ -416,6 +455,8 @@ contract SlotCurate {
         return _slot.used && !overRequestPeriod && !_slot.beingDisputed;
     }
 
+    // redo this. this is not how it actually works. arbitrator rule is what decides
+    // if you can cashout.
     function canCashoutContributions(uint64 _disputeSlot) view public returns (bool) {
         Dispute storage dispute = disputes[_disputeSlot];
         Slot storage slot = slots[dispute.slotId];
