@@ -71,6 +71,8 @@
 */
 
 contract SlotCurate {
+
+    uint constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
     
     enum ProcessType {
         Add,
@@ -85,16 +87,16 @@ contract SlotCurate {
     enum DisputeState {
         Free, // you can take slot
         Ruling, // arbitrator is ruling...
-        Funding, // users can contribute to seed next round
-        Cashout // you can call withdraw rewards. Probably, not needed (just check timestamp)
+        Funding // users can contribute to seed next round. could also mean "over" if timestamp.
     }
 
     // settings cannot be mutated once created
     struct Settings {
         // you don't need to store created
-        uint requestPeriod;
         uint requesterStake;
         uint challengerStake;
+        uint40 requestPeriod;
+        uint40 fundingPeriod;
         //  store arbitrator?
         //  store extraData?!?!
     }
@@ -136,7 +138,7 @@ contract SlotCurate {
     struct Contribution {
         uint8 round; // could be bigger, there's enough space by shifting amount.
         Party party;
-        uint80 amount; // to be raised 24 bits.
+        uint80 amount; // to be raised 32 bits.
         address contributor; // could be compressed to 64 bits, but there's no point.
     }
     
@@ -186,13 +188,14 @@ contract SlotCurate {
 
     // settings
     // bit of a draft since I havent done the dispute side of things yet
-    function createSettings(uint _requestPeriod, uint _requesterStake, uint _challengerStake) public {
+    function createSettings(uint _requesterStake, uint _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod) public {
         // put safeguard check? for checking if settingsCount is -1.
         require(settingsCount != 4294967295, "Max settings reached"); // there'd be 4.3B so please just reuse one
         Settings storage settings = settingsMap[settingsCount++];
-        settings.requestPeriod = _requestPeriod;
         settings.requesterStake = _requesterStake;
         settings.challengerStake = _challengerStake;
+        settings.requestPeriod = _requestPeriod;
+        settings.fundingPeriod = _fundingPeriod;
         emit SettingsCreated(_requestPeriod, _requesterStake, _challengerStake);
     }
     
@@ -286,6 +289,19 @@ contract SlotCurate {
         dispute.challenger = msg.sender;
     }
 
+    function contribute(uint64 _disputeSlot, Party _party) public payable {
+        Dispute storage dispute = disputes[_disputeSlot];
+        require(dispute.state == DisputeState.Funding, "Dispute is not in funding state");
+        // compress amount, possibly losing up to 4 gwei. they will be burnt.
+        uint80 amount = uint80(msg.value >> AMOUNT_BITSHIFT);
+        contributions[_disputeSlot][dispute.nContributions++] = Contribution({
+            round: dispute.currentRound + 1,
+            party: _party,
+            contributor: msg.sender,
+            amount: amount
+        });
+    }
+
     // rule:
     /*
         because disputeId is stored in the dispute slots,
@@ -359,5 +375,14 @@ contract SlotCurate {
         Settings storage settings = settingsMap[_slot.settingsId];
         bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
         return _slot.used && !overRequestPeriod && !_slot.beingDisputed;
+    }
+
+    function canCashoutContributions(uint64 _disputeSlot) view public returns (bool) {
+        Dispute storage dispute = disputes[_disputeSlot];
+        Slot storage slot = slots[dispute.slotId];
+        Settings storage settings = settingsMap[slot.settingsId];
+        bool overFundingPeriod = block.timestamp > dispute.timestamp + settings.fundingPeriod;
+        // cashout state can be derived from timestamp + funding. if it wasn't funded in time then its over.
+        return overFundingPeriod && dispute.state == DisputeState.Funding;
     }
 }
