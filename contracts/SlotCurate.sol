@@ -302,6 +302,45 @@ contract SlotCurate {
         });
     }
 
+    function startNextRound(uint64 _disputeSlot, uint64 _firstContributionForRound) public {
+        Dispute storage dispute = disputes[_disputeSlot];
+        uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
+        require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
+        Contribution memory firstContribution = contributions[_disputeSlot][_firstContributionForRound];
+        require(nextRound == firstContribution.round, "This contribution is for another round");
+        // get required fees from somewhere. how? is it expensive? do I just calculate here?
+        // look into this later. for now just make the total amount up.
+        uint80 totalAmountNeeded = 3000;
+        uint80 sumOfAmounts = firstContribution.amount;
+        uint64 i = _firstContributionForRound;
+        bool successFlag = false;
+        for (;; i++) {
+            Contribution storage contribution = contributions[_disputeSlot][i];
+            // break if round changes.
+            // actually theres a better way to do this. fix this abomination.
+            // you dont need to check round, you could just do the for until
+            // you run out of nContributions
+            // because you cannot bullshit the rounds anyway
+            // no one can make a contribution with the wrong round.
+            if (nextRound != contribution.round) {
+                break;
+            }
+            sumOfAmounts = sumOfAmounts + contribution.amount;
+            // break if needed sum is reached
+            if (sumOfAmounts >= totalAmountNeeded) {
+                successFlag = true;
+                break;
+            }
+        }
+        require(successFlag, "Insufficient amount");
+        uint actualAmount = totalAmountNeeded << uint80(AMOUNT_BITSHIFT);
+        // something is done with the actual amount
+        // its divided by something or whatever and you get the fees
+        // or maybe you already know, and read from settings or a view func.
+        // bs event to make VS Code shut up. TODO.
+        emit ItemAdded(uint64(actualAmount));
+    }
+
     // rule:
     /*
         because disputeId is stored in the dispute slots,
