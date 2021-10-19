@@ -57,6 +57,17 @@
     maybe, do the same thing I'm doing but put some assembly level optimizations
     since I can tell the compiler is messing up the order of the calls and wasting gas.
     would make it hard to audit.
+
+    an idea (that shouldn't be implemented) is using basic compression
+    instead of storing contributors in the contributor field of the contribution
+    store contributor in the contributors mapping. and then you can just put an id
+    lets say you use uint64 as identifier. that's 96 bits saved.
+    using this you could get away with storing stuff in half the space.
+    effectively halving the creation of new slots.
+    could could work for process slots. just save the addresses there.
+    however 32 extra bits would have to be saved somewhere to make it work.
+    use a view function to check if you need to create a new address.
+    (you'd prob use a batch transaction to submit the address first)
 */
 
 contract SlotCurate {
@@ -71,6 +82,13 @@ contract SlotCurate {
         Challenger
     }
     
+    enum DisputeState {
+        Free, // you can take slot
+        Ruling, // arbitrator is ruling...
+        Funding, // users can contribute to seed next round
+        Cashout // you can call withdraw rewards. Probably, not needed (just check timestamp)
+    }
+
     // settings cannot be mutated once created
     struct Settings {
         // you don't need to store created
@@ -87,7 +105,7 @@ contract SlotCurate {
         uint64 freeSpace;
     }
     
-    // if you compress bools and enum into 1 byte
+    // if you compress bools and enum into 1 byte (uint8)
     // 2 vacant bytes    
     struct Slot {
         bool used;
@@ -101,17 +119,25 @@ contract SlotCurate {
     // all bounded data related to the Dispute. unbounded data such as contributions is handled out
     // todo
     struct Dispute {
-        uint256 arbitratorDisputeId; // there's no way around this
-        bool used;
+        // you could save 8 bits by just having "used" be nContributions == 0.
+        // and setting nContributions to zero when contribs are cashed out, so dispute slot is available.
+        // but there's no gas to save doing so (yet)
+        uint256 arbitratorDisputeId; // required
         uint64 slotId; // flexible
-        uint32 nContributions; // flexible
+        address challenger; // store it here instead of contributions[dispute][0]
+        DisputeState state; 
+        uint8 currentRound;
+        uint24 freeSpace;
+        uint64 nContributions; // if 0, it means slot is unused.
+        uint40 timestamp; // to derive  
+        uint152 freeSpace2;
     }
     
     struct Contribution {
-        uint8 round;
+        uint8 round; // could be bigger, there's enough space by shifting amount.
         Party party;
-        uint80 amount; // to be raised 16 bits.
-        address contributor;
+        uint80 amount; // to be raised 24 bits.
+        address contributor; // could be compressed to 64 bits, but there's no point.
     }
     
     // EVENTS //
@@ -132,8 +158,9 @@ contract SlotCurate {
     mapping(uint64 => Slot) slots;
     mapping(uint64 => Dispute) disputes;
     mapping(uint64 => List) lists;
-    mapping(uint32 => Settings) settingsMap; // encoded with uint32 to make an attack unfeasible
-    mapping(uint256 => mapping(uint256 => Contribution)) contributions; // contributions[disputeSlot][n]
+    // encoded with uint32 to make an attack unfeasible, but could go 2 extra bytes.
+    mapping(uint32 => Settings) settingsMap;
+    mapping(uint256 => mapping(uint64 => Contribution)) contributions; // contributions[disputeSlot][n]
     
     constructor() {
     }
@@ -235,17 +262,28 @@ contract SlotCurate {
         Settings storage settings = settingsMap[slot.settingsId];
         require(msg.value >= settings.challengerStake, "This is not enough to cover challenger stake");
         Dispute storage dispute = disputes[_disputeSlot];
-        require(!dispute.used, "That dispute slot is being used");
+        require(dispute.state == DisputeState.Free, "That dispute slot is being used");
 
-        slot.beingDisputed = true;
         // it will be challenged now
 
         // arbitrator magic happens here (pay fees, maybe read how much juror fees are...)
         // and get disputeId so that you can store it, you know.
+        // we try to create the dispute first, then update values here.
 
-        dispute.used = true;
-        dispute.nContributions = 1; // storing requester is a waste. just compute it separately
+        //  weird edge cases:
+        // with juror fees increasing, and item is quickly requested
+        // before list settings are updated.
+        // the item might not have enough in stake to pay juror fees, and this
+        // would always fail. not sure how to proceed, then.
+        // i wouldn't trust an arbitrator that can pull that off.
+
+        slot.beingDisputed = true;
+        dispute.state = DisputeState.Ruling;
+        dispute.nContributions = 0;
         dispute.slotId = _slotIndex;
+        // round is 0, amount is in dispute.slotId -> slot.settings -> settings.challengerStake, party is challenger
+        // so it's a waste to create a contrib. just integrate it with dispute slot.
+        dispute.challenger = msg.sender;
     }
 
     // rule:
