@@ -73,7 +73,10 @@
 contract SlotCurate {
 
     uint constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
-    
+    uint constant EXCLUDED_RULING = 1934287879142079143413243242; // if you exclude one of the 2^256 rulings
+    // you can make rule(...) save 1 storage slot and save 20k.
+    // verify that arbitrator is NOT calling this ruling.
+    // this will not be used, ill just commit so that i remember this optimization for later.
     enum ProcessType {
         Add,
         Removal
@@ -97,7 +100,8 @@ contract SlotCurate {
         uint challengerStake;
         uint40 requestPeriod;
         uint40 fundingPeriod;
-        //  store arbitrator?
+        address arbitrator;
+        uint16 freeSpace;
         //  store extraData?!?!
     }
     
@@ -141,6 +145,11 @@ contract SlotCurate {
         uint80 amount; // to be raised 32 bits.
         address contributor; // could be compressed to 64 bits, but there's no point.
     }
+
+    struct StoredRuling {
+        uint ruling;
+        bool ruled; // this bit costs 20k gas
+    }
     
     // EVENTS //
     
@@ -163,6 +172,7 @@ contract SlotCurate {
     // encoded with uint32 to make an attack unfeasible, but could go 2 extra bytes.
     mapping(uint32 => Settings) settingsMap;
     mapping(uint256 => mapping(uint64 => Contribution)) contributions; // contributions[disputeSlot][n]
+    mapping(address => mapping(uint256 => StoredRuling)) storedRulings; // storedRulings[arbitrator][disputeId]
     
     constructor() {
     }
@@ -322,6 +332,7 @@ contract SlotCurate {
             // you run out of nContributions
             // because you cannot bullshit the rounds anyway
             // no one can make a contribution with the wrong round.
+            // todo
             if (nextRound != contribution.round) {
                 break;
             }
@@ -342,61 +353,51 @@ contract SlotCurate {
     }
 
     function executeRuling(uint64 _disputeSlot) public {
-        /*
-            I want to rethink how to do this.
-            is it "executeRuling" or "withdrawFeesAndRewards"
-            you should withdrawFeesAndRewards the moment you execute the dispute
-            otherwise something could overwrite the contributions before they are cashed out.
-            so "executeRuling" and "withdrawFeesAndRewards" are kind of the same.
-
-            ok, but that's not the issue. the issue is that the cashout bool made sense.
-            but it's not how it really works.
-            what actually happens is that arbitrator sets the ruling.
-            then you call the function to execute the ruling.
-            there's a problem with how the rule func works right now
-            it only allows for one single arbitrator to be able to write to ALL lists.
-
-            let me explain...
-            the problem "rule" was trying to solve is that, because disputes can be in any slot,
-            instead of searching for the one, just write to a mapping.
-            but, that mapping doesn't know if that arbitrator is allowed to write to that mapping,
-            actually.
-            you could make that easily happen:
-            just make a first storage write on that mapping for that disputeId when challenging.
-            and write the arbitrator there.
-            so, when rule is called, arbitrator will check if he's allowed to write on the mapping.
-            this'd make challenging 20k more expensive per challenge and allows to use different arbitrators.
-            why cannot (shouldnt) rule be called without this aid, because looking for dispute slot has worst case O(n)
-            so attacker could create enough disputes to reach gas limit and stop rule from happening.
-
-        */
-        require(canCashoutContributions(_disputeSlot), "You cannot cash out this dispute");
-        // now we cash out the dispute
-        // round 0
-        // the amount to withdraw is made up.
-
-
-        // nvm redo this.
-
+        //1. get arbitrator for that setting, and disputeId from disputeSlot.
+        Dispute storage dispute = disputes[_disputeSlot];
+        Slot storage slot = slots[dispute.slotId];
+        Settings storage settings = settingsMap[slot.settingsId];
+        //   2. make sure that disputeSlot has an ongoing dispute
+        require(dispute.state == DisputeState.Funding, "Dispute can only be executed in Funding state");
+        //    3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
+        StoredRuling memory storedRuling = storedRulings[settings.arbitrator][dispute.arbitratorDisputeId];
+        require(storedRuling.ruled, "This wasn't ruled by the designated arbitrator");
+        //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
+        //    default to requester, in that case.
+        // 0 refuse, 1 requester, 2 challenger.
+        if(storedRuling.ruling == 1 || storedRuling.ruling == 0) {
+            // requester won.
+            if(slot.processType == ProcessType.Add) {
+                emit ItemAdded(dispute.slotId);
+            } else {
+                emit ItemRemoved(dispute.slotId);
+            }
+        } else {
+            // challenger won.
+            if(slot.processType == ProcessType.Add) {
+                emit ItemRemoved(dispute.slotId);
+            } else {
+                emit ItemAdded(dispute.slotId);
+            }
+        }
+        // 5. withdraw rewards
+        withdrawRewards(_disputeSlot);
+        // 6. dispute and slot are now Free.
+        slot.used = false;
+        dispute.state = DisputeState.Free; // to avoid someone withdrawing rewards twice.
     }
 
     // rule:
-    /*
-        because disputeId is stored in the dispute slots,
-        but rule doesn't know in which dispute slot it is stored, 
-        there are 2 ways to go about this:
-        
-        the O(n) way: just read all disputes until you find
-        disputeId == _disputeId
-        and execute the action there.
-        could be cheaper, but cost grows as the number of slots grows
-        (and might be subject to attack)
+    function rule(uint _disputeId, uint _ruling) external {
+        storedRulings[msg.sender][_disputeId] = StoredRuling({
+            ruling: _ruling,
+            ruled: true
+        });
+    }
 
-        the storage way: store the ruling in Rulings[disputeId], along with a timestamp.
-        and just have another func "executeRuling" separately, on the dispute. the dispute slot know the disputeId,
-        but the disputeId doesn't know the dispute slot.
-        has a fixed cost of ~45k, such is life.
-    */
+    function withdrawRewards(uint64 _disputeSlot) private {
+        // todo
+    }
     
     
     // VIEW FUNCTIONS
