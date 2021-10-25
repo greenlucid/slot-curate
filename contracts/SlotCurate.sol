@@ -6,16 +6,16 @@
  * @deployments: []
  * SPDX-License-Identifier: Licenses are not real
  */
- 
- pragma solidity ^0.8.9;
+
+ pragma solidity ^0.8.4;
 
 /*
     things to think about
-    
+
     put an option to manually call the function to calculate juror fees and store it locally
     instead of calling an expensive function over contracts every time
     this would get harder if we store arbitrator / arbextradata separately
-    
+
     put the most used functions (add, remove item) as first functions because that
     makes it cheaper
 
@@ -30,18 +30,18 @@
 contract SlotCurate {
 
     uint constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
-    
+
     enum ProcessType {
         Add,
         Removal,
         Edit
     }
-    
+
     enum Party {
         Requester,
         Challenger
     }
-    
+
     enum DisputeState {
         Free, // you can take slot
         Ruling, // arbitrator is ruling...
@@ -59,20 +59,20 @@ contract SlotCurate {
         uint16 freeSpace;
         //  store extraData?!?!
     }
-    
+
     struct List {
         uint48 settingsId;
         address governor; // governors can change governor of the list, and change settingsId
         uint48 freeSpace;
     }
-    
+
     struct Slot {
         uint8 slotdata; // holds "used", "processType" and "disputed", compressed in the same variable.
         uint48 settingsId; // settings spam attack is highly unlikely (1M years of full 15M gas blocks)
         uint40 requestTime; // overflow in 37k years
         address requester;
     }
-    
+
     // all bounded data related to the Dispute. unbounded data such as contributions is handled out
     // todo
     struct Dispute {
@@ -82,14 +82,14 @@ contract SlotCurate {
         uint256 arbitratorDisputeId; // required
         uint64 slotId; // flexible
         address challenger; // store it here instead of contributions[dispute][0]
-        DisputeState state; 
+        DisputeState state;
         uint8 currentRound;
         uint24 freeSpace;
         uint64 nContributions; // if 0, it means slot is unused.
-        uint40 timestamp; // to derive  
+        uint40 timestamp; // to derive
         uint152 freeSpace2;
     }
-    
+
     struct Contribution {
         uint8 round; // could be bigger, there's enough space by shifting amount.
         Party party;
@@ -101,9 +101,9 @@ contract SlotCurate {
         uint ruling;
         bool ruled; // this bit costs 20k gas
     }
-    
+
     // EVENTS //
-    
+
     event ListCreated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
     event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
     event SettingsCreated(uint _requestPeriod, uint _requesterStake, uint _challengerStake);
@@ -111,8 +111,8 @@ contract SlotCurate {
     event ItemAdded(uint64 _slotIndex);
     event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
     event ItemRemoved(uint64 _slotIndex);
-    
-    
+
+
     // CONTRACT STORAGE //
     uint64 listCount;
     uint48 settingsCount; // to prevent from assigning invalid settings to lists.
@@ -124,12 +124,12 @@ contract SlotCurate {
     mapping(uint48 => Settings) settingsMap;
     mapping(uint256 => mapping(uint64 => Contribution)) contributions; // contributions[disputeSlot][n]
     mapping(address => mapping(uint256 => StoredRuling)) storedRulings; // storedRulings[arbitrator][disputeId]
-    
+
     constructor() {
     }
-    
+
     // PUBLIC FUNCTIONS
-    
+
     // lists
     function createList(address _governor, uint48 _settingsId, string memory _ipfsUri) public {
         require(_settingsId < settingsCount, "Settings must exist");
@@ -159,7 +159,7 @@ contract SlotCurate {
         settings.fundingPeriod = _fundingPeriod;
         emit SettingsCreated(_requestPeriod, _requesterStake, _challengerStake);
     }
-    
+
     // no refunds for overpaying. consider it burned. refunds are bloat.
 
     // you could add an "emergency" boolean option.
@@ -187,7 +187,7 @@ contract SlotCurate {
         slot.settingsId = _settingsId;
         emit ItemAddRequest(_listIndex, _slotIndex, _ipfsUri);
     }
-    
+
     // list is checked in subgraph. settings is trusted here.
     // if settings was not the one settings in subgraph at the time,
     // then subgraph will ignore the removal (so it has no effect when exec.)
@@ -206,7 +206,7 @@ contract SlotCurate {
         slot.settingsId = _settingsId;
         emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
     }
-    
+
     function executeRequest(uint64 _slotIndex) public {
         Slot storage slot = slots[_slotIndex];
         require(slotIsExecutable(slot), "Slot cannot be executed");
@@ -385,10 +385,10 @@ contract SlotCurate {
             the settings of the list and then remove the item, so there's a workaround.
         */
     }
-    
-    
+
+
     // VIEW FUNCTIONS
-    
+
     // relying on this by itself could result on users colliding on same slot
     // user which is late will have the transaction cancelled, but gas wasted and unhappy ux
     // could be used to make an "emergency slot", in case your slot submission was in an used slot.
@@ -401,7 +401,7 @@ contract SlotCurate {
         }
         return i;
     }
-    
+
     // debugging purposes, for now. shouldn't be too expensive and could be useful in future, tho
     // doesn't actually "count" the slots, just checks until there's a virgin slot
     // it's the same as "maxSlots" in the notes
@@ -412,7 +412,7 @@ contract SlotCurate {
         }
         return i;
     }
-    
+
     // this is prob bloat. based on the idea of generating a random free slot, to avoid collisions.
     // could be used to advice the users to wait until there's free slot for gas savings.
     function countFreeSlots() view public returns (uint64) {
@@ -428,18 +428,18 @@ contract SlotCurate {
         }
         return freeSlots;
     }
-    
+
     function viewSlot(uint64 _slotIndex) view public returns (Slot memory) {
         return slots[_slotIndex];
     }
-    
+
     function slotIsExecutable(Slot memory _slot) view public returns (bool) {
         Settings storage settings = settingsMap[_slot.settingsId];
         bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
         (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
         return used && overRequestPeriod && !disputed;
     }
-    
+
     function slotCanBeChallenged(Slot memory _slot) view public returns (bool) {
         Settings storage settings = settingsMap[_slot.settingsId];
         bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
