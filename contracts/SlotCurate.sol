@@ -12,10 +12,6 @@
 /*
     things to think about
     
-    even though ItemRemoved and ItemAdded are the same functionality wise
-    it is cheaper to have them as separate events to avoid putting more variables
-    because each aditional variable is paid.
-    
     put an option to manually call the function to calculate juror fees and store it locally
     instead of calling an expensive function over contracts every time
     this would get harder if we store arbitrator / arbextradata separately
@@ -23,46 +19,12 @@
     put the most used functions (add, remove item) as first functions because that
     makes it cheaper
 
-    with rollups it is very important to compress function args
-    consider making:
-    slot uint64
-    listId uint64
-    settings being an uint32 may provide surface attack. a spammer could spam
-    and create tons of settings so that no new settings could be ever created.
-    4B of settings at 150k per creation can hold 17 years of having all blocks fully creating settings.
-    with so much time and so many settings, maybe there's a few useful ones?
-
-    // adding the list requires made it SUPER expensive.
-    // now it's 38k to add item. not acceptable.
-    // what ill do instead is, just verify it on the subgraph instead.
-    // if user posts list that doesn't exist, or posts settings that are not the current settings of that list
-    // then subgraph will act as if item didn't exist. or, maybe track it but as an invalid item.
-    // this means, now you have to submit the settings in the args...?
-    // maybe instead submit list, do the extra read but don't do require.
-    yup. that removed 4k cost, just like that.
-    now 50.6k to create initially, and 33545 in used slot.
-    if settings not in args, 52.4k initially and 35186 in used slot.
-    changing the order: 52286, 
-    AND means you can do it by only verifying list exists in subgraph.
-    and i wasn't even verifying minimum stake... yeah seems like it's up to 35.4k again.
-
     ideas for the future:
     not even store all data to verify the process on chain. you could let invalid process on chain
     just exist and finish, and ignore them.
     you could even not store the lists logic at all, make them just be another item submission, somehow.
     again, the terms will be stored off chain, so whoever doesn't play by the rules is just ignored
     and you let their process exist and do whatever.
-
-    an idea (that shouldn't be implemented) is using basic compression
-    instead of storing contributors in the contributor field of the contribution
-    store contributor in the contributors mapping. and then you can just put an id
-    lets say you use uint64 as identifier. that's 96 bits saved.
-    using this you could get away with storing stuff in half the space.
-    effectively halving the creation of new slots.
-    could could work for process slots. just save the addresses there.
-    however 32 extra bits would have to be saved somewhere to make it work.
-    use a view function to check if you need to create a new address.
-    (you'd prob use a batch transaction to submit the address first)
 */
 
 contract SlotCurate {
@@ -72,6 +34,7 @@ contract SlotCurate {
     enum ProcessType {
         Add,
         Removal
+        // todo edit.
     }
     
     enum Party {
@@ -98,18 +61,14 @@ contract SlotCurate {
     }
     
     struct List {
-        uint32 settingsId;
+        uint48 settingsId;
         address governor; // governors can change governor of the list, and change settingsId
-        uint64 freeSpace;
+        uint48 freeSpace;
     }
     
-    // if you compress bools and enum into 1 byte (uint8)
-    // 2 vacant bytes    
     struct Slot {
-        bool used;
-        ProcessType processType;
-        bool beingDisputed;
-        uint32 settingsId; // to discourage settings spam attack. maybe put the 2 bytes here.
+        uint8 slotdata; // holds "used", "processType" and "disputed", compressed in the same variable.
+        uint48 settingsId; // settings spam attack is highly unlikely (1M years of full 15M gas blocks)
         uint40 requestTime; // overflow in 37k years
         address requester;
     }
@@ -145,24 +104,24 @@ contract SlotCurate {
     
     // EVENTS //
     
-    event ListCreated(uint64 _listIndex, uint32 _settingsId, address _governor, string _ipfsUri);
-    event ListUpdated(uint64 _listIndex, uint32 _settingsId, address _governor);
+    event ListCreated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
+    event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
     event SettingsCreated(uint _requestPeriod, uint _requesterStake, uint _challengerStake);
     event ItemAddRequest(uint64 _listIndex, uint64 _slotIndex, string _ipfsUri);
     event ItemAdded(uint64 _slotIndex);
-    event ItemRemovalRequest(uint64 _workSlot, uint32 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
+    event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
     event ItemRemoved(uint64 _slotIndex);
     
     
     // CONTRACT STORAGE //
     uint64 listCount;
-    uint32 settingsCount; // to prevent from assigning invalid settings to lists.
+    uint48 settingsCount; // to prevent from assigning invalid settings to lists.
 
     mapping(uint64 => Slot) slots;
     mapping(uint64 => Dispute) disputes;
     mapping(uint64 => List) lists;
-    // encoded with uint32 to make an attack unfeasible, but could go 2 extra bytes.
-    mapping(uint32 => Settings) settingsMap;
+    // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
+    mapping(uint48 => Settings) settingsMap;
     mapping(uint256 => mapping(uint64 => Contribution)) contributions; // contributions[disputeSlot][n]
     mapping(address => mapping(uint256 => StoredRuling)) storedRulings; // storedRulings[arbitrator][disputeId]
     
@@ -172,7 +131,7 @@ contract SlotCurate {
     // PUBLIC FUNCTIONS
     
     // lists
-    function createList(address _governor, uint32 _settingsId, string memory _ipfsUri) public {
+    function createList(address _governor, uint48 _settingsId, string memory _ipfsUri) public {
         require(_settingsId < settingsCount, "Settings must exist");
         List storage list = lists[listCount++];
         list.governor = _governor;
@@ -180,7 +139,7 @@ contract SlotCurate {
         emit ListCreated(listCount - 1, _settingsId, _governor, _ipfsUri);
     }
 
-    function updateList(uint64 _listIndex, uint32 _settingsId, address _newGovernor) public {
+    function updateList(uint64 _listIndex, uint48 _settingsId, address _newGovernor) public {
         List storage list = lists[_listIndex];
         require(msg.sender == list.governor, "You need to be the governor");
         list.governor = _newGovernor;
@@ -214,17 +173,18 @@ contract SlotCurate {
     // in the contract, listIndex and settingsId are trusted.
     // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
     // then item will be ignored or marked as invalid.
-    function addItem(uint64 _listIndex, uint32 _settingsId, uint64 _slotIndex, string memory _ipfsUri) public payable {
+    function addItem(uint64 _listIndex, uint48 _settingsId, uint64 _slotIndex, string memory _ipfsUri) public payable {
         Slot storage slot = slots[_slotIndex];
-        require(slot.used == false, "Slot must not be in use");
+        (bool used,,) = slotdataToParams(slot.slotdata);
+        require(used == false, "Slot must not be in use");
         Settings storage settings = settingsMap[_settingsId];
         require(msg.value >= settings.requesterStake, "This is not enough to cover initil stake");
-        slot.settingsId = _settingsId;
-        slot.used = true;
-        slot.processType = ProcessType.Add;
-        slot.beingDisputed = false;
+        // used: false, processType: Add, disputed: false
+        uint8 slotdata = paramsToSlotdata(false, ProcessType.Add, false);
+        slot.slotdata = slotdata;
         slot.requestTime = uint40(block.timestamp);
         slot.requester = msg.sender;
+        slot.settingsId = _settingsId;
         emit ItemAddRequest(_listIndex, _slotIndex, _ipfsUri);
     }
     
@@ -232,33 +192,35 @@ contract SlotCurate {
     // if settings was not the one settings in subgraph at the time,
     // then subgraph will ignore the removal (so it has no effect when exec.)
     // could even be challenged as an ilegal request to extract the stake, if significant.
-    function removeItem(uint64 _workSlot, uint32 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
+    function removeItem(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
         Slot storage slot = slots[_workSlot];
-        require(slot.used == false, "Slot must not be in use");
+        (bool used,,) = slotdataToParams(slot.slotdata);
+        require(used == false, "Slot must not be in use");
         Settings storage settings = settingsMap[_settingsId];
         require(msg.value >= settings.requesterStake, "This is not enough to cover requester stake");
-        slot.settingsId = _settingsId;
-        slot.used = true;
-        slot.processType = ProcessType.Removal;
-        slot.beingDisputed = false;
+        // used: false, processType: Add, disputed: false
+        uint8 slotdata = paramsToSlotdata(false, ProcessType.Removal, false);
+        slot.slotdata = slotdata;
         slot.requestTime = uint40(block.timestamp);
         slot.requester = msg.sender;
+        slot.settingsId = _settingsId;
         emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
     }
     
     function executeRequest(uint64 _slotIndex) public {
         Slot storage slot = slots[_slotIndex];
         require(slotIsExecutable(slot), "Slot cannot be executed");
-        // it will be executed now
-        slot.used = false;
+        (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
         Settings storage settings = settingsMap[slot.settingsId];
         payable(slot.requester).transfer(settings.requesterStake);
-        if (slot.processType == ProcessType.Add) {
+        if (processType == ProcessType.Add) {
             emit ItemAdded(_slotIndex);
         }
         else {
             emit ItemRemoved(_slotIndex);
         }
+        // used to false, others don't matter.
+        slot.slotdata = paramsToSlotdata(false, ProcessType.Add, false);
     }
 
     function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
@@ -282,7 +244,10 @@ contract SlotCurate {
         // would always fail. not sure how to proceed, then.
         // i wouldn't trust an arbitrator that can pull that off.
 
-        slot.beingDisputed = true;
+        (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
+        uint8 newSlotdata = paramsToSlotdata(true, processType, true);
+
+        slot.slotdata = newSlotdata;
         dispute.state = DisputeState.Ruling;
         dispute.nContributions = 0;
         dispute.slotId = _slotIndex;
@@ -357,16 +322,17 @@ contract SlotCurate {
         //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
         //    default to requester, in that case.
         // 0 refuse, 1 requester, 2 challenger.
+        (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
         if(storedRuling.ruling == 1 || storedRuling.ruling == 0) {
             // requester won.
-            if(slot.processType == ProcessType.Add) {
+            if(processType == ProcessType.Add) {
                 emit ItemAdded(dispute.slotId);
             } else {
                 emit ItemRemoved(dispute.slotId);
             }
         } else {
             // challenger won.
-            if(slot.processType == ProcessType.Add) {
+            if(processType == ProcessType.Add) {
                 emit ItemRemoved(dispute.slotId);
             } else {
                 emit ItemAdded(dispute.slotId);
@@ -375,7 +341,7 @@ contract SlotCurate {
         // 5. withdraw rewards
         withdrawRewards(_disputeSlot);
         // 6. dispute and slot are now Free.
-        slot.used = false;
+        slot.slotdata = paramsToSlotdata(false, ProcessType.Add, false);
         dispute.state = DisputeState.Free; // to avoid someone withdrawing rewards twice.
     }
 
@@ -400,7 +366,8 @@ contract SlotCurate {
     // will get the first Virgin, or Created slot.
     function firstFreeSlot(uint64 _startPoint) view public returns (uint64) {
         uint64 i = _startPoint;
-        while (slots[i].used) {
+        // this is used == true, because if used, slotdata is of shape 1xx00000, so it's larger than 127
+        while (slots[i].slotdata > 127) {
             i = i + 1;
         }
         return i;
@@ -425,42 +392,35 @@ contract SlotCurate {
         uint64 freeSlots = 0;
         for (; i < slotCount; i++) {
             Slot storage slot = slots[i];
-            if (!slot.used) {
+            // !slot.used ; so slotdata is smaller than 128
+            if (slot.slotdata < 128) {
                 freeSlots++;
             }
         }
         return freeSlots;
     }
     
-    function viewSlot(uint32 _slotIndex) view public returns (Slot memory) {
+    function viewSlot(uint64 _slotIndex) view public returns (Slot memory) {
         return slots[_slotIndex];
     }
     
     function slotIsExecutable(Slot memory _slot) view public returns (bool) {
         Settings storage settings = settingsMap[_slot.settingsId];
         bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
-        return _slot.used && overRequestPeriod && !_slot.beingDisputed;
+        (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
+        return used && overRequestPeriod && !disputed;
     }
     
     function slotCanBeChallenged(Slot memory _slot) view public returns (bool) {
         Settings storage settings = settingsMap[_slot.settingsId];
         bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
-        return _slot.used && !overRequestPeriod && !_slot.beingDisputed;
+        (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
+        return used && !overRequestPeriod && !disputed;
     }
 
-    // redo this. this is not how it actually works. arbitrator rule is what decides
-    // if you can cashout.
-    function canCashoutContributions(uint64 _disputeSlot) view public returns (bool) {
-        Dispute storage dispute = disputes[_disputeSlot];
-        Slot storage slot = slots[dispute.slotId];
-        Settings storage settings = settingsMap[slot.settingsId];
-        bool overFundingPeriod = block.timestamp > dispute.timestamp + settings.fundingPeriod;
-        // cashout state can be derived from timestamp + funding. if it wasn't funded in time then its over.
-        return overFundingPeriod && dispute.state == DisputeState.Funding;
-    }
-
-    // make a pure function that returns "slotData" given parameters such as
+    // returns "slotdata" given parameters such as
     // used, processType and disputed, in a single encoded uint8.
+    // TODO adapt for edit ProcessType (2 bits now)
     function paramsToSlotdata(bool _used, ProcessType _processType, bool _disputed) public pure returns (uint8) {
         uint8 usedAddend;
         if (_used) usedAddend = 128;
@@ -472,7 +432,7 @@ contract SlotCurate {
         return slotdata;
     }
 
-    // also make a pure function that returns a tuple with these three from a given slotData
+    // returns a tuple with these three from a given slotdata
     function slotdataToParams(uint8 _slotdata) public pure returns (bool, ProcessType, bool) {
         uint8 usedAddend = _slotdata & 128;
         bool used = usedAddend != 0;
