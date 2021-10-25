@@ -12,10 +12,9 @@
 /*
     things to think about
     
-    ItemRemoved and ItemAdded are the same contract wise
-    An optimization would be to just have an SlotExecuted with the slot and the enum
-    So there are no branches figuring out which one, and it's slightly cheaper to deploy.
-    maybe not. the only way to tell is to go and actually try it.
+    even though ItemRemoved and ItemAdded are the same functionality wise
+    it is cheaper to have them as separate events to avoid putting more variables
+    because each aditional variable is paid.
     
     put an option to manually call the function to calculate juror fees and store it locally
     instead of calling an expensive function over contracts every time
@@ -54,10 +53,6 @@
     again, the terms will be stored off chain, so whoever doesn't play by the rules is just ignored
     and you let their process exist and do whatever.
 
-    maybe, do the same thing I'm doing but put some assembly level optimizations
-    since I can tell the compiler is messing up the order of the calls and wasting gas.
-    would make it hard to audit.
-
     an idea (that shouldn't be implemented) is using basic compression
     instead of storing contributors in the contributor field of the contribution
     store contributor in the contributors mapping. and then you can just put an id
@@ -73,10 +68,7 @@
 contract SlotCurate {
 
     uint constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
-    uint constant EXCLUDED_RULING = 1934287879142079143413243242; // if you exclude one of the 2^256 rulings
-    // you can make rule(...) save 1 storage slot and save 20k.
-    // verify that arbitrator is NOT calling this ruling.
-    // this will not be used, ill just commit so that i remember this optimization for later.
+    
     enum ProcessType {
         Add,
         Removal
@@ -465,5 +457,29 @@ contract SlotCurate {
         bool overFundingPeriod = block.timestamp > dispute.timestamp + settings.fundingPeriod;
         // cashout state can be derived from timestamp + funding. if it wasn't funded in time then its over.
         return overFundingPeriod && dispute.state == DisputeState.Funding;
+    }
+
+    // make a pure function that returns "slotData" given parameters such as
+    // used, processType and disputed, in a single encoded uint8.
+    function paramsToSlotdata(bool _used, ProcessType _processType, bool _disputed) public pure returns (uint8) {
+        uint8 usedAddend;
+        if (_used) usedAddend = 128;
+        uint8 processTypeAddend;
+        if (_processType == ProcessType.Removal) processTypeAddend = 64;
+        uint8 disputedAddend;
+        if (_disputed) disputedAddend = 32;
+        uint8 slotdata = usedAddend + processTypeAddend + disputedAddend;
+        return slotdata;
+    }
+
+    // also make a pure function that returns a tuple with these three from a given slotData
+    function slotdataToParams(uint8 _slotdata) public pure returns (bool, ProcessType, bool) {
+        uint8 usedAddend = _slotdata & 128;
+        bool used = usedAddend != 0;
+        uint8 processTypeAddend = _slotdata & 64;
+        ProcessType processType = ProcessType(processTypeAddend >> 6);
+        uint8 disputedAddend = _slotdata & 32;
+        bool disputed = disputedAddend != 0;
+        return (used, processType, disputed);
     }
 }
