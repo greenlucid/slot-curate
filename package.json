@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@kleros/erc-792": "^8.0.0",
     "hardhat": "^2.6.7"
   },
   "devDependencies": {
@@ -18,9 +19,12 @@
     "ethereum-waffle": "^3.0.0",
     "ethers": "^5.0.0",
     "hardhat-gas-reporter": "^1.0.4",
-    "prettier": "^2.3.2",
+    "prettier": "^2.4.1",
     "prettier-plugin-solidity": "^1.0.0-beta.13",
     "solhint": "^3.3.6",
     "solidity-coverage": "^0.7.16"
+  },
+  "volta": {
+    "node": "14.18.1"
   }
 }
