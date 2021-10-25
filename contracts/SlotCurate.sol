@@ -33,8 +33,8 @@ contract SlotCurate {
     
     enum ProcessType {
         Add,
-        Removal
-        // todo edit.
+        Removal,
+        Edit
     }
     
     enum Party {
@@ -228,6 +228,8 @@ contract SlotCurate {
         require(slotCanBeChallenged(slot), "Slot cannot be challenged");
         Settings storage settings = settingsMap[slot.settingsId];
         require(msg.value >= settings.challengerStake, "This is not enough to cover challenger stake");
+        // TODO you need to check if the submission time has passed. because then, challenger cannot challenge
+        // someone needs to execute the process.
         Dispute storage dispute = disputes[_disputeSlot];
         require(dispute.state == DisputeState.Free, "That dispute slot is being used");
 
@@ -307,6 +309,10 @@ contract SlotCurate {
         // or maybe you already know, and read from settings or a view func.
         // bs event to make VS Code shut up. TODO.
         emit ItemAdded(uint64(actualAmount));
+        // and then you call the function of the arbitrator with value equal to "actualAmount"
+        // plus a few gwei, because we're may be losing to rounding errors.
+        // or we could make contributors pay slightly more gwei just to always be on the safe side.
+
     }
 
     function executeRuling(uint64 _disputeSlot) public {
@@ -355,6 +361,29 @@ contract SlotCurate {
 
     function withdrawRewards(uint64 _disputeSlot) private {
         // todo
+
+        /*
+            withdraw rewards
+            ok whats the deal with this
+            do arbitrator remember the fees they have for each dispute? is it different for each dispute?
+            because this is pretty important actually
+            if it doesn't remember, even if I query for fees every single time (which is super inefficient)
+            I would be fucked up
+
+            if they remember, you'd need to ask for fees:
+            - when challenging
+            - when withdrawing rewards, to substract the total cost of the dispute.
+            (or, you could store the total cost somewhere in the dispute data.)
+            - when advancing to next round.
+
+            edge case:
+            some settings don't work anymore
+            because arbitrator changes fees while there's a submitted item
+            and the submitter stake and challenger stake no longer cover the dispute, so it cannot start.
+            in that case, we could revert and make it impossible to challenge. e.g. let submitter
+            just pick up their reward. someone can create new settings, edit
+            the settings of the list and then remove the item, so there's a workaround.
+        */
     }
     
     
