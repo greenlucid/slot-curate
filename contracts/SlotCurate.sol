@@ -112,7 +112,7 @@ contract SlotCurate is IArbitrable {
 
   // EVENTS //
 
-  event ListCreated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
+  event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
   event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, address _arbitrator);
@@ -155,7 +155,7 @@ contract SlotCurate is IArbitrable {
     List storage list = lists[listCount++];
     list.governor = _governor;
     list.settingsId = _settingsId;
-    emit ListCreated(listCount - 1, _settingsId, _governor, _ipfsUri);
+    emit ListCreated(_settingsId, _governor, _ipfsUri);
   }
 
   function updateList(
