@@ -27,6 +27,13 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     you could even not store the lists logic at all, make them just be another item submission, somehow.
     again, the terms will be stored off chain, so whoever doesn't play by the rules is just ignored
     and you let their process exist and do whatever.
+
+    consider should we have remover / challenger submit "reason", somehow? as another ipfs.
+    that'd make those events ~2k more expensive
+    but should make the challenging / removing process more healthy.
+    if the removal / challenging reason is proved wrong, then even if the item somehow
+    doesn't belong there, it is allowed.
+    that reduces the scope of arguments, evidence, etc.
 */
 
 contract SlotCurate is IArbitrable {
@@ -108,10 +115,18 @@ contract SlotCurate is IArbitrable {
   event ListCreated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
   event SettingsCreated(uint256 _requestPeriod, uint256 _requesterStake, uint256 _challengerStake);
-  event ItemAddRequest(uint64 _listIndex, uint64 _slotIndex, string _ipfsUri);
-  event ItemAdded(uint64 _slotIndex);
+  // why emit settingsId in the request events?
+  // it's cheaper to trust the settingsId in the contract, than get it from the list and verifying X
+  // which I don't remember... TODO recheck this. look into getting it from list without verifying.
+  // this would entail again, verifying that list exists in the subgraph, or whatever.
+  // the subgraph can check the list at that time and ignore requests with invalid thing.
+  // so that the result of the dispute is meaningless for Curate................
+  event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _slotIndex, string _ipfsUri);
   event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
-  event ItemRemoved(uint64 _slotIndex);
+  event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
+  // you don't need different events for accept / reject because subgraph remembers the progress per slot.
+  event RequestAccepted(uint64 _slotIndex);
+  event RequestRejected(uint64 _slotIndex);
 
   // CONTRACT STORAGE //
   uint64 internal listCount;
@@ -194,13 +209,14 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: false, processType: Add, disputed: false
-    uint8 slotdata = paramsToSlotdata(false, ProcessType.Add, false);
+    // used: true, disputed: false, processType: Add 
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
     slot.slotdata = slotdata;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemAddRequest(_listIndex, _slotIndex, _ipfsUri);
+    // I don't remember why I removed the trusted settingsId emission before. review this.
+    emit ItemAddRequest(_listIndex, _settingsId, _slotIndex, _ipfsUri);
   }
 
   // list is checked in subgraph. settings is trusted here.
@@ -218,8 +234,8 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: false, processType: Add, disputed: false
-    uint8 slotdata = paramsToSlotdata(false, ProcessType.Removal, false);
+    // used: true, disputed: false, processType: Removal 
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
     slot.slotdata = slotdata;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -227,19 +243,29 @@ contract SlotCurate is IArbitrable {
     emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
+  function editItem(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
+    Slot storage slot = slots[_workSlot];
+    (bool used, , ) = slotdataToParams(slot.slotdata);
+    require(used == false, "Slot must not be in use");
+    Settings storage settings = settingsMap[_settingsId];
+    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    // used: true, disputed: false, processType: Edit
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
+    slot.slotdata = slotdata;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+  }
+
   function executeRequest(uint64 _slotIndex) public {
     Slot storage slot = slots[_slotIndex];
     require(slotIsExecutable(slot), "Slot cannot be executed");
-    (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
     Settings storage settings = settingsMap[slot.settingsId];
     payable(slot.requester).transfer(settings.requesterStake);
-    if (processType == ProcessType.Add) {
-      emit ItemAdded(_slotIndex);
-    } else {
-      emit ItemRemoved(_slotIndex);
-    }
+    emit RequestAccepted(_slotIndex);
     // used to false, others don't matter.
-    slot.slotdata = paramsToSlotdata(false, ProcessType.Add, false);
+    slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
   }
 
   function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
@@ -265,8 +291,8 @@ contract SlotCurate is IArbitrable {
     // would always fail. not sure how to proceed, then.
     // i wouldn't trust an arbitrator that can pull that off.
 
-    (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
-    uint8 newSlotdata = paramsToSlotdata(true, processType, true);
+    (, , ProcessType processType) = slotdataToParams(slot.slotdata);
+    uint8 newSlotdata = paramsToSlotdata(true, true, processType);
 
     slot.slotdata = newSlotdata;
     dispute.state = DisputeState.Ruling;
@@ -322,7 +348,7 @@ contract SlotCurate is IArbitrable {
     // its divided by something or whatever and you get the fees
     // or maybe you already know, and read from settings or a view func.
     // bs event to make VS Code shut up. TODO.
-    emit ItemAdded(uint64(actualAmount));
+    emit RequestAccepted(uint64(actualAmount));
     // and then you call the function of the arbitrator with value equal to "actualAmount"
     // plus a few gwei, because we're may be losing to rounding errors.
     // or we could make contributors pay slightly more gwei just to always be on the safe side.
@@ -341,26 +367,17 @@ contract SlotCurate is IArbitrable {
     //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
     //    default to requester, in that case.
     // 0 refuse, 1 requester, 2 challenger.
-    (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
     if (storedRuling.ruling == 1 || storedRuling.ruling == 0) {
       // requester won.
-      if (processType == ProcessType.Add) {
-        emit ItemAdded(dispute.slotId);
-      } else {
-        emit ItemRemoved(dispute.slotId);
-      }
+      emit RequestAccepted(dispute.slotId);
     } else {
       // challenger won.
-      if (processType == ProcessType.Add) {
-        emit ItemRemoved(dispute.slotId);
-      } else {
-        emit ItemAdded(dispute.slotId);
-      }
+      emit RequestRejected(dispute.slotId);
     }
     // 5. withdraw rewards
     withdrawRewards(_disputeSlot);
-    // 6. dispute and slot are now Free.
-    slot.slotdata = paramsToSlotdata(false, ProcessType.Add, false);
+    // 6. dispute and slot are now Free.. other slotdata doesn't matter.
+    slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
     dispute.state = DisputeState.Free; // to avoid someone withdrawing rewards twice.
   }
 
@@ -446,14 +463,14 @@ contract SlotCurate is IArbitrable {
   function slotIsExecutable(Slot memory _slot) public view returns (bool) {
     Settings storage settings = settingsMap[_slot.settingsId];
     bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
-    (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
+    (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used && overRequestPeriod && !disputed;
   }
 
   function slotCanBeChallenged(Slot memory _slot) public view returns (bool) {
     Settings storage settings = settingsMap[_slot.settingsId];
     bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
-    (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
+    (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used && !overRequestPeriod && !disputed;
   }
 
@@ -462,15 +479,16 @@ contract SlotCurate is IArbitrable {
   // TODO adapt for edit ProcessType (2 bits now)
   function paramsToSlotdata(
     bool _used,
-    ProcessType _processType,
-    bool _disputed
+    bool _disputed,
+    ProcessType _processType
   ) public pure returns (uint8) {
     uint8 usedAddend;
     if (_used) usedAddend = 128;
-    uint8 processTypeAddend;
-    if (_processType == ProcessType.Removal) processTypeAddend = 64;
     uint8 disputedAddend;
-    if (_disputed) disputedAddend = 32;
+    if (_disputed) disputedAddend = 64;
+    uint8 processTypeAddend;
+    if (_processType == ProcessType.Removal) processTypeAddend = 16;
+    if (_processType == ProcessType.Edit) processTypeAddend = 32;
     uint8 slotdata = usedAddend + processTypeAddend + disputedAddend;
     return slotdata;
   }
@@ -481,16 +499,18 @@ contract SlotCurate is IArbitrable {
     pure
     returns (
       bool,
-      ProcessType,
-      bool
+      bool,
+      ProcessType
     )
   {
     uint8 usedAddend = _slotdata & 128;
     bool used = usedAddend != 0;
-    uint8 processTypeAddend = _slotdata & 64;
-    ProcessType processType = ProcessType(processTypeAddend >> 6);
-    uint8 disputedAddend = _slotdata & 32;
+    uint8 disputedAddend = _slotdata & 64;
     bool disputed = disputedAddend != 0;
-    return (used, processType, disputed);
+
+    uint8 processTypeAddend = _slotdata & 48;
+    ProcessType processType = ProcessType(processTypeAddend >> 4);
+    
+    return (used, disputed, processType);
   }
 }
