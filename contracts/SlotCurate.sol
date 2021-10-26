@@ -30,7 +30,7 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
 */
 
 contract SlotCurate is IArbitrable {
-  uint256 constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
+  uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
 
   enum ProcessType {
     Add,
@@ -114,18 +114,16 @@ contract SlotCurate is IArbitrable {
   event ItemRemoved(uint64 _slotIndex);
 
   // CONTRACT STORAGE //
-  uint64 listCount;
-  uint48 settingsCount; // to prevent from assigning invalid settings to lists.
+  uint64 internal listCount;
+  uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
 
-  mapping(uint64 => Slot) slots;
-  mapping(uint64 => Dispute) disputes;
-  mapping(uint64 => List) lists;
+  mapping(uint64 => Slot) internal slots;
+  mapping(uint64 => Dispute) internal disputes;
+  mapping(uint64 => List) internal lists;
   // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
-  mapping(uint48 => Settings) settingsMap;
-  mapping(uint256 => mapping(uint64 => Contribution)) contributions; // contributions[disputeSlot][n]
-  mapping(address => mapping(uint256 => StoredRuling)) storedRulings; // storedRulings[arbitrator][disputeId]
-
-  constructor() {}
+  mapping(uint48 => Settings) internal settingsMap;
+  mapping(uint256 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
+  mapping(address => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
 
   // PUBLIC FUNCTIONS
 
@@ -195,7 +193,7 @@ contract SlotCurate is IArbitrable {
     (bool used, , ) = slotdataToParams(slot.slotdata);
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "This is not enough to cover initil stake");
+    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
     // used: false, processType: Add, disputed: false
     uint8 slotdata = paramsToSlotdata(false, ProcessType.Add, false);
     slot.slotdata = slotdata;
@@ -219,7 +217,7 @@ contract SlotCurate is IArbitrable {
     (bool used, , ) = slotdataToParams(slot.slotdata);
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "This is not enough to cover requester stake");
+    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
     // used: false, processType: Add, disputed: false
     uint8 slotdata = paramsToSlotdata(false, ProcessType.Removal, false);
     slot.slotdata = slotdata;
@@ -248,7 +246,7 @@ contract SlotCurate is IArbitrable {
     Slot storage slot = slots[_slotIndex];
     require(slotCanBeChallenged(slot), "Slot cannot be challenged");
     Settings storage settings = settingsMap[slot.settingsId];
-    require(msg.value >= settings.challengerStake, "This is not enough to cover challenger stake");
+    require(msg.value >= settings.challengerStake, "Not enough to cover stake");
     // TODO you need to check if the submission time has passed. because then, challenger cannot challenge
     // someone needs to execute the process.
     Dispute storage dispute = disputes[_disputeSlot];
@@ -292,7 +290,7 @@ contract SlotCurate is IArbitrable {
     uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
     require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
     Contribution memory firstContribution = contributions[_disputeSlot][_firstContributionForRound];
-    require(nextRound == firstContribution.round, "This contribution is for another round");
+    require(nextRound == firstContribution.round, "Contrib is for another round");
     // get required fees from somewhere. how? is it expensive? do I just calculate here?
     // look into this later. for now just make the total amount up.
     uint80 totalAmountNeeded = 3000;
@@ -336,10 +334,10 @@ contract SlotCurate is IArbitrable {
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
     //   2. make sure that disputeSlot has an ongoing dispute
-    require(dispute.state == DisputeState.Funding, "Dispute can only be executed in Funding state");
+    require(dispute.state == DisputeState.Funding, "Can only be executed in Funding");
     //    3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
     StoredRuling memory storedRuling = storedRulings[settings.arbitrator][dispute.arbitratorDisputeId];
-    require(storedRuling.ruled, "This wasn't ruled by the designated arbitrator");
+    require(storedRuling.ruled, "Wasn't ruled by the arbitrator");
     //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
     //    default to requester, in that case.
     // 0 refuse, 1 requester, 2 challenger.
@@ -367,11 +365,9 @@ contract SlotCurate is IArbitrable {
   }
 
   function rule(uint256 _disputeId, uint256 _ruling) external override {
-    require(storedRulings[msg.sender][_disputeId].ruled == false);
+    // no need to check if already ruled, every arbitrator is trusted.
+    // arbitrators that "cheat" don't matter, no one will use them.
     storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: _ruling, ruled: true});
-
-    executeRuling(disputes[uint64(_disputeId)].slotId); // TODO: move logic inside executeRuling to inside rule. No need a function call overhead.
-
     emit Ruling(IArbitrator(msg.sender), _disputeId, _ruling);
   }
 
