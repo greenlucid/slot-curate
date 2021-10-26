@@ -56,7 +56,7 @@ contract SlotCurate is IArbitrable {
     Funding // users can contribute to seed next round. could also mean "over" if timestamp.
   }
 
-  // settings cannot be mutated once created
+  // settings cannot be mutated once created, otherwise pending processes could get attacked.
   struct Settings {
     // you don't need to store created
     uint256 requesterStake;
@@ -114,7 +114,8 @@ contract SlotCurate is IArbitrable {
 
   event ListCreated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
-  event SettingsCreated(uint256 _requestPeriod, uint256 _requesterStake, uint256 _challengerStake);
+  // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
+  event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, address _arbitrator);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than get it from the list and verifying X
   // which I don't remember... TODO recheck this. look into getting it from list without verifying.
@@ -149,6 +150,8 @@ contract SlotCurate is IArbitrable {
     string memory _ipfsUri
   ) public {
     require(_settingsId < settingsCount, "Settings must exist");
+    // requiring that listCount != type(uint64).max is not needed. makes it ~1k more expensive
+    // and listCount exceeding that number is just not gonna happen. ~32B years of filling blocks.
     List storage list = lists[listCount++];
     list.governor = _governor;
     list.settingsId = _settingsId;
@@ -173,16 +176,21 @@ contract SlotCurate is IArbitrable {
     uint256 _requesterStake,
     uint256 _challengerStake,
     uint40 _requestPeriod,
-    uint40 _fundingPeriod
+    uint40 _fundingPeriod,
+    address _arbitrator
   ) public {
-    // put safeguard check? for checking if settingsCount is -1.
-    require(settingsCount != 4294967295, "Max settings reached"); // there'd be 4.3B so please just reuse one
+    // require is not used. there can be up to 281T.
+    // that's 1M years of full 15M gas blocks every 13s.
+    // skipping it makes this cheaper. overflow is not gonna happen.
+    // a rollup in which this was a risk might be possible, but then just remake the contract.
+    // require(settingsCount != type(uint48).max, "Max settings reached");
     Settings storage settings = settingsMap[settingsCount++];
     settings.requesterStake = _requesterStake;
     settings.challengerStake = _challengerStake;
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
-    emit SettingsCreated(_requestPeriod, _requesterStake, _challengerStake);
+    settings.arbitrator = _arbitrator;
+    emit SettingsCreated(_requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator);
   }
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
