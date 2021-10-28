@@ -179,8 +179,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 _challengerStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
-    bytes calldata _arbitratorExtraData,
     IArbitrator _arbitrator,
+    bytes calldata _arbitratorExtraData,
     string memory _addMetaEvidence,
     string memory _removeMetaEvidence,
     string memory _updateMetaEvidence
@@ -222,7 +222,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _listIndex,
     uint48 _settingsId,
     uint64 _slotIndex,
-    string memory _ipfsUri
+    string calldata _ipfsUri
   ) public payable {
     Slot storage slot = slots[_slotIndex];
     (bool used, , ) = slotdataToParams(slot.slotdata);
