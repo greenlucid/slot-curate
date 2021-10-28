@@ -10,6 +10,7 @@
 pragma solidity ^0.8.4;
 import "@kleros/erc-792/contracts/IArbitrable.sol";
 import "@kleros/erc-792/contracts/IArbitrator.sol";
+import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 
 /*
     things to think about
@@ -36,7 +37,8 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     that reduces the scope of arguments, evidence, etc.
 */
 
-contract SlotCurate is IArbitrable {
+contract SlotCurate is IArbitrable, IEvidence {
+  uint8 constant NUMBER_OF_RULING_OPTIONS = 2;
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
 
   enum ProcessType {
@@ -63,9 +65,9 @@ contract SlotCurate is IArbitrable {
     uint256 challengerStake;
     uint40 requestPeriod;
     uint40 fundingPeriod;
-    address arbitrator;
+    bytes arbitratorExtraData;
+    IArbitrator arbitrator;
     uint16 freeSpace;
-    //  store extraData?!?!
   }
 
   struct List {
@@ -83,7 +85,7 @@ contract SlotCurate is IArbitrable {
 
   // all bounded data related to the Dispute. unbounded data such as contributions is handled out
   // todo
-  struct Dispute {
+  struct DisputeStruct {
     // you could save 8 bits by just having "used" be nContributions == 0.
     // and setting nContributions to zero when contribs are cashed out, so dispute slot is available.
     // but there's no gas to save doing so (yet)
@@ -107,7 +109,7 @@ contract SlotCurate is IArbitrable {
 
   struct StoredRuling {
     uint256 ruling;
-    bool ruled; // this bit costs 20k gas (ferit: bool is uint8 under the hood, don't forget.)
+    bool ruled; // this bit costs 20k gas
   }
 
   // EVENTS //
@@ -115,7 +117,7 @@ contract SlotCurate is IArbitrable {
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
-  event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, address _arbitrator);
+  event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, IArbitrator _arbitrator);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than get it from the list and verifying X
   // which I don't remember... TODO recheck this. look into getting it from list without verifying.
@@ -134,12 +136,12 @@ contract SlotCurate is IArbitrable {
   uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
 
   mapping(uint64 => Slot) internal slots;
-  mapping(uint64 => Dispute) internal disputes;
+  mapping(uint64 => DisputeStruct) internal disputes;
   mapping(uint64 => List) internal lists;
   // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
   mapping(uint48 => Settings) internal settingsMap;
   mapping(uint256 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
-  mapping(address => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
+  mapping(IArbitrator => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
 
   // PUBLIC FUNCTIONS
 
@@ -177,7 +179,11 @@ contract SlotCurate is IArbitrable {
     uint256 _challengerStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
-    address _arbitrator
+    bytes calldata _arbitratorExtraData,
+    IArbitrator _arbitrator,
+    string memory _addMetaEvidence,
+    string memory _removeMetaEvidence,
+    string memory _updateMetaEvidence
   ) public {
     // require is not used. there can be up to 281T.
     // that's 1M years of full 15M gas blocks every 13s.
@@ -190,6 +196,12 @@ contract SlotCurate is IArbitrable {
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
     settings.arbitrator = _arbitrator;
+    settings.arbitratorExtraData = _arbitratorExtraData;
+
+    emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
+    emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
+    emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
+
     emit SettingsCreated(_requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator);
   }
 
@@ -217,7 +229,7 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Add 
+    // used: true, disputed: false, processType: Add
     uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
     slot.slotdata = slotdata;
     slot.requestTime = uint40(block.timestamp);
@@ -242,7 +254,7 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Removal 
+    // used: true, disputed: false, processType: Removal
     uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
     slot.slotdata = slotdata;
     slot.requestTime = uint40(block.timestamp);
@@ -251,7 +263,12 @@ contract SlotCurate is IArbitrable {
     emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
-  function editItem(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
+  function editItem(
+    uint64 _workSlot,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    uint40 _idRequestTime
+  ) public payable {
     Slot storage slot = slots[_workSlot];
     (bool used, , ) = slotdataToParams(slot.slotdata);
     require(used == false, "Slot must not be in use");
@@ -283,7 +300,7 @@ contract SlotCurate is IArbitrable {
     require(msg.value >= settings.challengerStake, "Not enough to cover stake");
     // TODO you need to check if the submission time has passed. because then, challenger cannot challenge
     // someone needs to execute the process.
-    Dispute storage dispute = disputes[_disputeSlot];
+    DisputeStruct storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Free, "That dispute slot is being used");
 
     // it will be challenged now
@@ -309,10 +326,25 @@ contract SlotCurate is IArbitrable {
     // round is 0, amount is in dispute.slotId -> slot.settings -> settings.challengerStake, party is challenger
     // so it's a waste to create a contrib. just integrate it with dispute slot.
     dispute.challenger = msg.sender;
+
+    /* ERC-792 and ERC-1497 implementation below */
+
+    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(settings.arbitratorExtraData);
+    require(msg.value >= arbitrationCost, "Not enough funds for this challenge.");
+    dispute.arbitratorDisputeId = settings.arbitrator.createDispute{value: msg.value}(NUMBER_OF_RULING_OPTIONS, settings.arbitratorExtraData);
+
+    uint256 evidenceGroupID = uint256(keccak256(abi.encodePacked(_slotIndex, _disputeSlot))); // TODO: Decide on evidenceGroupID. We should group evidence by per item and per request.
+    uint256 metaEvidenceID = ((3 * settingsCount) + uint48(processType)); // Having a different metaevidence for add, remove and update operations (processType).
+    emit Dispute(IArbitrator(settings.arbitrator), uint256(_disputeSlot), metaEvidenceID, evidenceGroupID);
+
+    if (msg.value > arbitrationCost) {
+      // Send excess value back.
+      payable(msg.sender).send(msg.value - arbitrationCost);
+    }
   }
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
-    Dispute storage dispute = disputes[_disputeSlot];
+    DisputeStruct storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Funding, "Dispute is not in funding state");
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
     uint80 amount = uint80(msg.value >> AMOUNT_BITSHIFT);
@@ -320,7 +352,7 @@ contract SlotCurate is IArbitrable {
   }
 
   function startNextRound(uint64 _disputeSlot, uint64 _firstContributionForRound) public {
-    Dispute storage dispute = disputes[_disputeSlot];
+    DisputeStruct storage dispute = disputes[_disputeSlot];
     uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
     require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
     Contribution memory firstContribution = contributions[_disputeSlot][_firstContributionForRound];
@@ -364,7 +396,7 @@ contract SlotCurate is IArbitrable {
 
   function executeRuling(uint64 _disputeSlot) public {
     //1. get arbitrator for that setting, and disputeId from disputeSlot.
-    Dispute storage dispute = disputes[_disputeSlot];
+    DisputeStruct storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
     //   2. make sure that disputeSlot has an ongoing dispute
@@ -392,8 +424,17 @@ contract SlotCurate is IArbitrable {
   function rule(uint256 _disputeId, uint256 _ruling) external override {
     // no need to check if already ruled, every arbitrator is trusted.
     // arbitrators that "cheat" don't matter, no one will use them.
-    storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: _ruling, ruled: true});
+    storedRulings[IArbitrator(msg.sender)][_disputeId] = StoredRuling({ruling: _ruling, ruled: true});
     emit Ruling(IArbitrator(msg.sender), _disputeId, _ruling);
+  }
+
+  function submitEvidence(uint64 _disputeSlot, string calldata _evidenceURI) external {
+    DisputeStruct storage dispute = disputes[_disputeSlot];
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+
+    uint256 evidenceGroupID = uint256(keccak256(abi.encodePacked(dispute.slotId, _disputeSlot)));
+    emit Evidence(IArbitrator(settings.arbitrator), evidenceGroupID, msg.sender, _evidenceURI); // We use _questionID for evidence group identifier.
   }
 
   function withdrawRewards(uint64 _disputeSlot) private {
@@ -518,7 +559,7 @@ contract SlotCurate is IArbitrable {
 
     uint8 processTypeAddend = _slotdata & 48;
     ProcessType processType = ProcessType(processTypeAddend >> 4);
-    
+
     return (used, disputed, processType);
   }
 }
