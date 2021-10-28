@@ -38,6 +38,7 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 */
 
 contract SlotCurate is IArbitrable, IEvidence {
+  uint8 constant NUMBER_OF_RULING_OPTIONS = 2;
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
 
   enum ProcessType {
@@ -64,11 +65,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 challengerStake;
     uint40 requestPeriod;
     uint40 fundingPeriod;
-    bytes8 subcourtID;
-    bytes8 numberOfVotes;
+    bytes arbitratorExtraData;
     IArbitrator arbitrator;
     uint16 freeSpace;
-    //  store extraData?!?!
   }
 
   struct List {
@@ -180,8 +179,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 _challengerStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
-    bytes8 _subcourtID,
-    bytes8 _numberOfVotes,
+    bytes calldata _arbitratorExtraData,
     IArbitrator _arbitrator,
     string memory _addMetaEvidence,
     string memory _removeMetaEvidence,
@@ -198,8 +196,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
     settings.arbitrator = _arbitrator;
-    settings.subcourtID = _subcourtID;
-    settings.numberOfVotes = _numberOfVotes;
+    settings.arbitratorExtraData = _arbitratorExtraData;
 
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
@@ -332,9 +329,9 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     /* ERC-792 and ERC-1497 implementation below */
 
-    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(bytes.concat(bytes32(settings.subcourtID), bytes32(settings.numberOfVotes)));
+    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(settings.arbitratorExtraData);
     require(msg.value >= arbitrationCost, "Not enough funds for this challenge.");
-    dispute.arbitratorDisputeId = settings.arbitrator.createDispute{value: msg.value}(uint256(2) + 1, bytes.concat(bytes32(settings.subcourtID), bytes32(settings.numberOfVotes)));
+    dispute.arbitratorDisputeId = settings.arbitrator.createDispute{value: msg.value}(NUMBER_OF_RULING_OPTIONS, settings.arbitratorExtraData);
 
     uint256 evidenceGroupID = uint256(keccak256(abi.encodePacked(_slotIndex, _disputeSlot))); // TODO: Decide on evidenceGroupID. We should group evidence by per item and per request.
     uint256 metaEvidenceID = ((3 * settingsCount) + uint48(processType)); // Having a different metaevidence for add, remove and update operations (processType).
