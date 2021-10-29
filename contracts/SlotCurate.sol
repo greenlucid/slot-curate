@@ -34,6 +34,123 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     if the removal / challenging reason is proved wrong, then even if the item somehow
     doesn't belong there, it is allowed.
     that reduces the scope of arguments, evidence, etc.
+
+    whats the point of forcing listCount to uint64?
+    there's no saving. maybe in rollups, someday?
+
+    if needed, you can store eth amounts as uint64.
+    rationale: uint88 is enough to index all current wei
+    put an extra byte to be in the same side. uint96.
+    discard the 4 gwei residue. it's uint64 now.
+
+    ok, i have to save the total amount contributed per side per round.
+    disputeId -> uint8 -> uint80[2]
+    totalContribution[disputeId][round][party]
+    but also cannot afford to have the storage slot reset to 0 every time.
+
+    having it as a mapping is more expensive than an array, isn't it?
+    because you have to put the keys onto storage as well. not sure! check.
+    because all structs are crafted to fit in exact number of slots. so if you can skip
+    storing keys, go for it.
+    somehow I doubt it's possible
+    I'm defo not storing TWO storage slots because then it'd be >60k.
+
+
+    remember to set the successor totalParties to zero on challenge, and on startNextRound
+
+    put more stuff into "totalContributions". rename it to "roundContributions" or something.
+    since I'm doing this anyway, let's just store the number of contributions in the round.
+    why? because of the following edge case.
+    say contribs are like this:
+    11112222222223333333333333
+    ok. and in the threes, there's enough
+    lets say there's enough with the starting 4 threeses...
+    yeah its not really a problem. we've already accepted this. contributions per the round may be
+    overpayed, and what will happen is that they will split the funds proportionally.
+
+    this is not really needed... you could just check if there's already enough to crowdfund for that round. no need for madness.
+    because we can check the total amount needed per party per round, right?
+    problem is we can only know for certain if we call the "calculate cost" function
+    and if we have to do that PER contribution then it will get so expensive.
+    so... lets go back to previous idea. read above.
+
+    fuck it, I don't care about it. lets ignore this and just remember about it
+    and talk about it later to check again if this is a problem.
+    it'd be easy to accomodate a solution if it was troublesome.
+
+    maybe I should check if thing is ruled before allowing rule.
+    and maybe I should have some timestamp thing to make sure arbitrator doesnt cheat
+    but really, whats the point of using an arbitrator if im going to write internal logic?
+    it was about trust. i dont want to overengineer this contract.
+
+
+    the whole "contribute a certain amount for x side" thing is not needed.
+    just check if you contribute the minimum required to advance for next round,
+    (this could be hardcoded, or customizable per setting. calculated as multiplier of appealCost)
+    when the dispute is resolved just split the spoils proportionally to the winning side.
+    edit: I understand it may need a "leap of faith" to believe that the incentives are set up correctly
+    but really, there are similarities with prediction markets
+    say contributor for challenger puts 2/3 of the amount needed
+    why would someone contribute for requester? if no one contributes, then requester wins automatically.
+    so its beneficial for requester and all previous requester contributors
+    but say someone believes in their side. then they just stake more.
+    if one side funded all of a round and lost, then the surplus would just get stuck inside the contract.
+    which you could collect as dev by making a function to cashout a round with this characteristic.
+    to governor or whatever
+
+
+    hey, for withdrawing in a round that wasnt completely funded,
+    dont do it like first version of curate, in which you couldn't get your contribution back.
+    get some way to get the funds out.
+
+    what to do when refuse to arbitrate is final? it just defaults to requester, so requester always has an edge.
+    it could default to challenger instead.
+
+    to make sure this is always infallible, store the cost of the appeal the moment it's actually done.
+    store it in RoundContributions
+    so whenever theres a withdrawal for one contribution (assume called the public version)
+    make sure its pending withdrawal
+    make sure its winning side
+    make sure contribution id is below nContributions
+    make sure pendingContributions != 0
+    get spoils by adding the two party amount, substracting appealCost
+    share = spoils * contribution.amount / partyTotal[winningParty]
+    send to contributor.
+    set contribution as withdrawn.
+    decrease pendingWithdrawals
+
+    advance Next Round:
+    check appeal cost
+    multiply it by surplusMultiplier (which is forcibly >1.5 or so. could fit uint8
+    by using low level hacking. say you use 4 bits as fractionary part.
+    alternatively, use uint16, uint24. because say there are very cheap appeal costs,
+    but list owner wants quite a lot of stake in the game. so that they can go higher.
+    uint32 sounds legit for extremely cheap disputes. 4 bits is still enough to store the fractionary part.
+    this multiplier approach will be limiting. its dependant on appeal cost
+    is there a way to make it fixed cost, or fixed increasing cost, somehow?
+    whatever, there's a way around that, just migrate to new settings with new cost.
+
+
+    make a lighter, private version of this that works without the first two conditions, 
+    and without setting contribution as withdrawn & without decreasing pendingWithdrawals
+    , to use in withdrawAllContributions.
+    then you can just write: pendingContributions = 0 at the end, that it has been completely withdrawn already.
+
+    you could check if a contribution is withdrawable if contribdata == some number. 128 or 192 depending
+    on winning party.
+    instead of storing it as a variable and reading from it, have an initial branch between parties.
+    and just check contribdata == 128.
+    that should save ~10 gas per iteration (xD)
+
+
+
+    also withdraw the zero round, if pending. (0 withdrawn, 1 pending)
+
+    wait. what about the "zero round"? you could have a 1 bit flag to check for that, in the dispute.
+
+    you can only challenge in a dispute slot if pendingContributions = 0 and zero round has been withdrawn.
+
+    store first round cost in dispute slot, so that you can tell how much to spoil away.
 */
 
 contract SlotCurate is IArbitrable {
@@ -59,13 +176,14 @@ contract SlotCurate is IArbitrable {
   // settings cannot be mutated once created, otherwise pending processes could get attacked.
   struct Settings {
     // you don't need to store created
-    uint256 requesterStake;
-    uint256 challengerStake;
+    uint80 requesterStake;
+    uint80 challengerStake;
     uint40 requestPeriod;
     uint40 fundingPeriod;
     address arbitrator;
     uint16 freeSpace;
-    //  store extraData?!?!
+    bytes32 arbitratorExtraData1;
+    bytes32 arbitratorExtraData2;
   }
 
   struct List {
@@ -94,15 +212,22 @@ contract SlotCurate is IArbitrable {
     uint8 currentRound;
     uint24 freeSpace;
     uint64 nContributions; // if 0, it means slot is unused.
+    uint64 pendingWithdraws; 
     uint40 timestamp; // to derive
-    uint152 freeSpace2;
+    uint88 freeSpace2;
   }
 
   struct Contribution {
     uint8 round; // could be bigger, there's enough space by shifting amount.
-    Party party;
+    uint8 contribdata; // compressed form of bool withdrawn, Party party.
     uint80 amount; // to be raised 32 bits.
     address contributor; // could be compressed to 64 bits, but there's no point.
+  }
+
+  struct RoundContributions {
+    uint80[2] partyTotal; // partyTotal[Party]
+    uint80 appealCost;
+    uint16 filler; // to make sure the storage slot never goes back to zero, set it to 1 on discovery.
   }
 
   struct StoredRuling {
@@ -138,7 +263,9 @@ contract SlotCurate is IArbitrable {
   mapping(uint64 => List) internal lists;
   // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
   mapping(uint48 => Settings) internal settingsMap;
-  mapping(uint256 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
+  mapping(uint64 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
+  // totalContributions[disputeId][round][Party]
+  mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(address => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
 
   // PUBLIC FUNCTIONS
@@ -281,8 +408,7 @@ contract SlotCurate is IArbitrable {
     require(slotCanBeChallenged(slot), "Slot cannot be challenged");
     Settings storage settings = settingsMap[slot.settingsId];
     require(msg.value >= settings.challengerStake, "Not enough to cover stake");
-    // TODO you need to check if the submission time has passed. because then, challenger cannot challenge
-    // someone needs to execute the process.
+    
     Dispute storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Free, "That dispute slot is being used");
 
@@ -292,12 +418,19 @@ contract SlotCurate is IArbitrable {
     // and get disputeId so that you can store it, you know.
     // we try to create the dispute first, then update values here.
 
+    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(
+      bytes.concat(settings.arbitratorExtraData1, settings.arbitratorExtraData2)
+    );
+
     //  weird edge cases:
     // with juror fees increasing, and item is quickly requested
     // before list settings are updated.
     // the item might not have enough in stake to pay juror fees, and this
     // would always fail. not sure how to proceed, then.
     // i wouldn't trust an arbitrator that can pull that off.
+    // edit: its (kind of) fine. the item would get accepted because it would pass the period
+    // list creator can update settings to solve the issue with the list. and then add removal request.
+    // maybe even changing arbitrator in the process.
 
     (, , ProcessType processType) = slotdataToParams(slot.slotdata);
     uint8 newSlotdata = paramsToSlotdata(true, true, processType);
@@ -305,6 +438,7 @@ contract SlotCurate is IArbitrable {
     slot.slotdata = newSlotdata;
     dispute.state = DisputeState.Ruling;
     dispute.nContributions = 0;
+    dispute.pendingWithdraws = 0;
     dispute.slotId = _slotIndex;
     // round is 0, amount is in dispute.slotId -> slot.settings -> settings.challengerStake, party is challenger
     // so it's a waste to create a contrib. just integrate it with dispute slot.
@@ -314,17 +448,21 @@ contract SlotCurate is IArbitrable {
   function contribute(uint64 _disputeSlot, Party _party) public payable {
     Dispute storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Funding, "Dispute is not in funding state");
+    uint8 nextRound = dispute.currentRound + 1;
+    uint8 contribdata = paramsToContribdata(false, _party);
+    dispute.nContributions++;
+    dispute.pendingWithdraws++;
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
     uint80 amount = uint80(msg.value >> AMOUNT_BITSHIFT);
-    contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: dispute.currentRound + 1, party: _party, contributor: msg.sender, amount: amount});
+    roundContributionsMap[_disputeSlot][nextRound].partyTotal[uint(_party)] += amount;
+    contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: nextRound, contribdata: contribdata, contributor: msg.sender, amount: amount});
   }
 
-  function startNextRound(uint64 _disputeSlot, uint64 _firstContributionForRound) public {
+  function startNextRound(uint64 _disputeSlot) public {
     Dispute storage dispute = disputes[_disputeSlot];
     uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
     require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
-    Contribution memory firstContribution = contributions[_disputeSlot][_firstContributionForRound];
-    require(nextRound == firstContribution.round, "Contrib is for another round");
+    
     // get required fees from somewhere. how? is it expensive? do I just calculate here?
     // look into this later. for now just make the total amount up.
     uint80 totalAmountNeeded = 3000;
@@ -430,7 +568,7 @@ contract SlotCurate is IArbitrable {
   // will get the first Virgin, or Created slot.
   function firstFreeSlot(uint64 _startPoint) public view returns (uint64) {
     uint64 i = _startPoint;
-    // this is used == true, because if used, slotdata is of shape 1xx00000, so it's larger than 127
+    // this is used == true, because if used, slotdata is of shape 1xxx0000, so it's larger than 127
     while (slots[i].slotdata > 127) {
       i = i + 1;
     }
@@ -482,9 +620,6 @@ contract SlotCurate is IArbitrable {
     return used && !overRequestPeriod && !disputed;
   }
 
-  // returns "slotdata" given parameters such as
-  // used, processType and disputed, in a single encoded uint8.
-  // TODO adapt for edit ProcessType (2 bits now)
   function paramsToSlotdata(
     bool _used,
     bool _disputed,
@@ -501,7 +636,6 @@ contract SlotCurate is IArbitrable {
     return slotdata;
   }
 
-  // returns a tuple with these three from a given slotdata
   function slotdataToParams(uint8 _slotdata)
     public
     pure
@@ -520,5 +654,24 @@ contract SlotCurate is IArbitrable {
     ProcessType processType = ProcessType(processTypeAddend >> 4);
     
     return (used, disputed, processType);
+  }
+
+  function paramsToContribdata(bool _withdrawn, Party _party) public pure returns (uint8) {
+    uint8 withdrawnAddend;
+    if (_withdrawn) withdrawnAddend = 128;
+    uint8 partyAddend;
+    if (_party == Party.Challenger) partyAddend = 64;
+
+    uint8 contribdata = withdrawnAddend + partyAddend;
+    return contribdata;
+  }
+
+  function contribdataToParams(uint8 _contribdata) public pure returns (bool, Party) {
+    uint8 withdrawnAddend = _contribdata & 128;
+    bool withdrawn = withdrawnAddend != 0;
+    uint8 partyAddend = _contribdata & 64;
+    Party party = Party(partyAddend >> 6);
+
+    return (withdrawn, party);
   }
 }
