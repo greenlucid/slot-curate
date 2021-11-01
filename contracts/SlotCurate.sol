@@ -14,6 +14,10 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
 /*
     things to think about
 
+    remove this comment when you skim through all the previous comments
+    and write "bugs" that really are deliberate decisions to optimize gas
+    and the workarounds there are around them.
+
     put an option to manually call the function to calculate juror fees and store it locally
     instead of calling an expensive function over contracts every time
     this would get harder if we store arbitrator / arbextradata separately
@@ -102,6 +106,10 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     hey, for withdrawing in a round that wasnt completely funded,
     dont do it like first version of curate, in which you couldn't get your contribution back.
     get some way to get the funds out.
+    this means that when withdrawAllContributions finds a contrib for a round
+    that never got disputed
+    then you stop checking for "winner", and just refund all contribs for that round.
+    e.g. send amount.
 
     what to do when refuse to arbitrate is final? it just defaults to requester, so requester always has an edge.
     it could default to challenger instead.
@@ -151,10 +159,19 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     you can only challenge in a dispute slot if pendingContributions = 0 and zero round has been withdrawn.
 
     store first round cost in dispute slot, so that you can tell how much to spoil away.
+
+    how does "rule" work. is it at the end of each appeal
+    or is it at the end of all, and it's final?
+    because I've assumed 2nd one. but that's probably not right, is it?
+    how does my contract get the information that the round has finished?
+    i need it to get timestamp
+    curate used this to know who had to contribute more for next round.
 */
 
 contract SlotCurate is IArbitrable {
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
+  uint256 internal constant RULING_OPTIONS = 2;
+  uint256 internal constant DIVIDER = 1000000;
 
   enum ProcessType {
     Add,
@@ -175,13 +192,14 @@ contract SlotCurate is IArbitrable {
 
   // settings cannot be mutated once created, otherwise pending processes could get attacked.
   struct Settings {
-    // you don't need to store created
     uint80 requesterStake;
     uint80 challengerStake;
     uint40 requestPeriod;
     uint40 fundingPeriod;
-    address arbitrator;
-    uint16 freeSpace;
+    uint16 freeSpace2;
+    IArbitrator arbitrator;
+    uint64 multiplier; // divide by DIVIDER for float.
+    uint32 freeSpace;
     bytes32 arbitratorExtraData1;
     bytes32 arbitratorExtraData2;
   }
@@ -200,21 +218,20 @@ contract SlotCurate is IArbitrable {
   }
 
   // all bounded data related to the Dispute. unbounded data such as contributions is handled out
-  // todo
+  // takes 3 slots
   struct Dispute {
-    // you could save 8 bits by just having "used" be nContributions == 0.
-    // and setting nContributions to zero when contribs are cashed out, so dispute slot is available.
-    // but there's no gas to save doing so (yet)
     uint256 arbitratorDisputeId; // required
     uint64 slotId; // flexible
     address challenger; // store it here instead of contributions[dispute][0]
     DisputeState state;
     uint8 currentRound;
-    uint24 freeSpace;
-    uint64 nContributions; // if 0, it means slot is unused.
+    bool pendingInitialWithdraw;
+    uint8 freeSpace;
+    uint64 nContributions;
     uint64 pendingWithdraws; 
     uint40 timestamp; // to derive
-    uint88 freeSpace2;
+    uint80 roundZeroCost; // to distribute requester / challenger reward. sure you need this?
+    uint8 freeSpace2;
   }
 
   struct Contribution {
@@ -300,8 +317,8 @@ contract SlotCurate is IArbitrable {
   // settings
   // bit of a draft since I havent done the dispute side of things yet
   function createSettings(
-    uint256 _requesterStake,
-    uint256 _challengerStake,
+    uint80 _requesterStake,
+    uint80 _challengerStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
     address _arbitrator
@@ -316,7 +333,7 @@ contract SlotCurate is IArbitrable {
     settings.challengerStake = _challengerStake;
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
-    settings.arbitrator = _arbitrator;
+    settings.arbitrator = IArbitrator(_arbitrator);
     emit SettingsCreated(_requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator);
   }
 
@@ -414,46 +431,53 @@ contract SlotCurate is IArbitrable {
 
     // it will be challenged now
 
-    // arbitrator magic happens here (pay fees, maybe read how much juror fees are...)
-    // and get disputeId so that you can store it, you know.
-    // we try to create the dispute first, then update values here.
+    bytes memory arbitratorExtraData = bytes.concat(settings.arbitratorExtraData1, settings.arbitratorExtraData2);
 
-    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(
-      bytes.concat(settings.arbitratorExtraData1, settings.arbitratorExtraData2)
-    );
+    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(arbitratorExtraData);
 
-    //  weird edge cases:
-    // with juror fees increasing, and item is quickly requested
-    // before list settings are updated.
-    // the item might not have enough in stake to pay juror fees, and this
-    // would always fail. not sure how to proceed, then.
-    // i wouldn't trust an arbitrator that can pull that off.
-    // edit: its (kind of) fine. the item would get accepted because it would pass the period
-    // list creator can update settings to solve the issue with the list. and then add removal request.
-    // maybe even changing arbitrator in the process.
+    // make sure stake covers arbitrationCost * multiplier! (why? because fees may change)
+    // uint totalInitialStake = decompressAmount(settings.requesterStake) + msg.value
+    // notice the difference. above is what could be used to have a workaround on
+    // "arbitrator changed juror fees" edge case. that way challenger can just stake
+    // any arbitrary amount, that added to requester stake makes the minimum cut.
+    // but that will require removing "challenger stake" from settings,
+    // and storing the challenger stake per dispute which is going to be more expensive.
+    // alt, you can have the requester + msg.value, and the excess is burnt.
+    // or if juror fees become too high, lost.
+    uint totalInitialStake = decompressAmount(settings.requesterStake + settings.challengerStake) * settings.multiplier / DIVIDER;
+    require(compressAmount(arbitrationCost) <= totalInitialStake, "Not enough for stake");
+
+    // actually call dispute
+    uint arbitratorDisputeId = settings.arbitrator.createDispute
+      { value: arbitrationCost }
+      (RULING_OPTIONS,arbitratorExtraData);
 
     (, , ProcessType processType) = slotdataToParams(slot.slotdata);
     uint8 newSlotdata = paramsToSlotdata(true, true, processType);
 
     slot.slotdata = newSlotdata;
+    dispute.arbitratorDisputeId = arbitratorDisputeId;
+    dispute.slotId = _slotIndex;
+    dispute.challenger = msg.sender;
     dispute.state = DisputeState.Ruling;
+    dispute.currentRound = 0;
+    dispute.pendingInitialWithdraw = true;
     dispute.nContributions = 0;
     dispute.pendingWithdraws = 0;
-    dispute.slotId = _slotIndex;
-    // round is 0, amount is in dispute.slotId -> slot.settings -> settings.challengerStake, party is challenger
-    // so it's a waste to create a contrib. just integrate it with dispute slot.
-    dispute.challenger = msg.sender;
+    dispute.timestamp = uint40(block.timestamp);
+    dispute.roundZeroCost = compressAmount(arbitrationCost);
   }
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
     Dispute storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Funding, "Dispute is not in funding state");
+    // todo make sure its also under period?
     uint8 nextRound = dispute.currentRound + 1;
     uint8 contribdata = paramsToContribdata(false, _party);
     dispute.nContributions++;
     dispute.pendingWithdraws++;
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
-    uint80 amount = uint80(msg.value >> AMOUNT_BITSHIFT);
+    uint80 amount = compressAmount(msg.value);
     roundContributionsMap[_disputeSlot][nextRound].partyTotal[uint(_party)] += amount;
     contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: nextRound, contribdata: contribdata, contributor: msg.sender, amount: amount});
   }
@@ -461,40 +485,33 @@ contract SlotCurate is IArbitrable {
   function startNextRound(uint64 _disputeSlot) public {
     Dispute storage dispute = disputes[_disputeSlot];
     uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
     require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
+    require(block.timestamp < uint(dispute.timestamp + settings.fundingPeriod), "Over funding period");
     
-    // get required fees from somewhere. how? is it expensive? do I just calculate here?
-    // look into this later. for now just make the total amount up.
-    uint80 totalAmountNeeded = 3000;
-    uint80 sumOfAmounts = firstContribution.amount;
-    uint64 i = _firstContributionForRound;
-    bool successFlag = false;
-    for (; ; i++) {
-      Contribution storage contribution = contributions[_disputeSlot][i];
-      // break if round changes.
-      // actually theres a better way to do this. fix this abomination.
-      // you dont need to check round, you could just do the for until
-      // you run out of nContributions
-      // because you cannot bullshit the rounds anyway
-      // no one can make a contribution with the wrong round.
-      // todo
-      if (nextRound != contribution.round) {
-        break;
-      }
-      sumOfAmounts = sumOfAmounts + contribution.amount;
-      // break if needed sum is reached
-      if (sumOfAmounts >= totalAmountNeeded) {
-        successFlag = true;
-        break;
-      }
-    }
-    require(successFlag, "Insufficient amount");
-    uint256 actualAmount = totalAmountNeeded << uint80(AMOUNT_BITSHIFT);
-    // something is done with the actual amount
-    // its divided by something or whatever and you get the fees
-    // or maybe you already know, and read from settings or a view func.
+    bytes memory arbitratorExtraData = bytes.concat(settings.arbitratorExtraData1, settings.arbitratorExtraData2);
+    uint appealCost = settings.arbitrator.appealCost(dispute.arbitratorDisputeId, arbitratorExtraData);
+    uint totalAmountNeeded = appealCost * settings.multiplier / DIVIDER;
+
+    // make sure you have the required amount
+    uint currentAmount = decompressAmount(roundContributionsMap[_disputeSlot][nextRound].partyTotal[0] + roundContributionsMap[_disputeSlot][nextRound].partyTotal[1]);
+    require(currentAmount >= totalAmountNeeded, "Not enough to fund round");
+    // mmm............
+    // apparently I have to do something related to "currentRuling"....
+    // TODO
+
+    /*
+      ok, at a high level this is how it works:
+      whenever people make settings, make sure settings.fundingPeriod is > rulingPeriod of arbor
+      disputestatus.RULING doesnt exist anymore. just let people contribute even if
+      theres not an updated ruling yet. even if they're disputing, why wait?
+      this is because you cant get period from arble.
+
+    */
+
     // bs event to make VS Code shut up. TODO.
-    emit RequestAccepted(uint64(actualAmount));
+    emit RequestAccepted(uint64(currentAmount));
     // and then you call the function of the arbitrator with value equal to "actualAmount"
     // plus a few gwei, because we're may be losing to rounding errors.
     // or we could make contributors pay slightly more gwei just to always be on the safe side.
@@ -508,7 +525,7 @@ contract SlotCurate is IArbitrable {
     //   2. make sure that disputeSlot has an ongoing dispute
     require(dispute.state == DisputeState.Funding, "Can only be executed in Funding");
     //    3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
-    StoredRuling memory storedRuling = storedRulings[settings.arbitrator][dispute.arbitratorDisputeId];
+    StoredRuling memory storedRuling = storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
     require(storedRuling.ruled, "Wasn't ruled by the arbitrator");
     //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
     //    default to requester, in that case.
@@ -673,5 +690,14 @@ contract SlotCurate is IArbitrable {
     Party party = Party(partyAddend >> 6);
 
     return (withdrawn, party);
+  }
+
+  // always compress / decompress rounding down. 
+  function compressAmount(uint _amount) public pure returns (uint80) {
+    return (uint80(_amount >> AMOUNT_BITSHIFT));
+  }
+
+  function decompressAmount(uint80 _compressedAmount) public pure returns (uint) {
+    return (uint(_compressedAmount) << AMOUNT_BITSHIFT);
   }
 }
