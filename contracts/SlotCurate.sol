@@ -166,6 +166,19 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     how does my contract get the information that the round has finished?
     i need it to get timestamp
     curate used this to know who had to contribute more for next round.
+
+
+
+    how to do the fundingPeriod contribute, appeal logic
+    if calling "appealPeriod" is cheap:
+    just query every contribute or appeal func.
+
+    if it's expensive:
+    check "appealDeadline" (the timestamp in dispute)
+    if you're over it, call appealPeriod. if 0, 0, you can't contribute or appeal.
+    if you get something different, you check if you're under "end".
+    if so, rewrite appealDeadline with end.
+    otherwise, revert.
 */
 
 contract SlotCurate is IArbitrable {
@@ -186,8 +199,7 @@ contract SlotCurate is IArbitrable {
 
   enum DisputeState {
     Free, // you can take slot
-    Ruling, // arbitrator is ruling...
-    Funding // users can contribute to seed next round. could also mean "over" if timestamp.
+    Used
   }
 
   // settings cannot be mutated once created, otherwise pending processes could get attacked.
@@ -229,7 +241,7 @@ contract SlotCurate is IArbitrable {
     uint8 freeSpace;
     uint64 nContributions;
     uint64 pendingWithdraws; 
-    uint40 timestamp; // to derive
+    uint40 appealDeadline; // to derive
     uint80 roundZeroCost; // to distribute requester / challenger reward. sure you need this?
     uint8 freeSpace2;
   }
@@ -435,19 +447,9 @@ contract SlotCurate is IArbitrable {
 
     uint256 arbitrationCost = settings.arbitrator.arbitrationCost(arbitratorExtraData);
 
-    // make sure stake covers arbitrationCost * multiplier! (why? because fees may change)
-    // uint totalInitialStake = decompressAmount(settings.requesterStake) + msg.value
-    // notice the difference. above is what could be used to have a workaround on
-    // "arbitrator changed juror fees" edge case. that way challenger can just stake
-    // any arbitrary amount, that added to requester stake makes the minimum cut.
-    // but that will require removing "challenger stake" from settings,
-    // and storing the challenger stake per dispute which is going to be more expensive.
-    // alt, you can have the requester + msg.value, and the excess is burnt.
-    // or if juror fees become too high, lost.
     uint totalInitialStake = decompressAmount(settings.requesterStake + settings.challengerStake) * settings.multiplier / DIVIDER;
     require(compressAmount(arbitrationCost) <= totalInitialStake, "Not enough for stake");
 
-    // actually call dispute
     uint arbitratorDisputeId = settings.arbitrator.createDispute
       { value: arbitrationCost }
       (RULING_OPTIONS,arbitratorExtraData);
@@ -459,19 +461,24 @@ contract SlotCurate is IArbitrable {
     dispute.arbitratorDisputeId = arbitratorDisputeId;
     dispute.slotId = _slotIndex;
     dispute.challenger = msg.sender;
-    dispute.state = DisputeState.Ruling;
+    dispute.state = DisputeState.Used;
     dispute.currentRound = 0;
     dispute.pendingInitialWithdraw = true;
     dispute.nContributions = 0;
     dispute.pendingWithdraws = 0;
-    dispute.timestamp = uint40(block.timestamp);
+    dispute.appealDeadline = 0;
     dispute.roundZeroCost = compressAmount(arbitrationCost);
+    dispute.freeSpace2 = 1; // to make sure slot never goes to zero.
   }
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
     Dispute storage dispute = disputes[_disputeSlot];
-    require(dispute.state == DisputeState.Funding, "Dispute is not in funding state");
-    // todo make sure its also under period?
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    require(dispute.state == DisputeState.Used, "Dispute has to be used");
+
+    _verifyUnderAppealDeadline(dispute, settings.arbitrator);
+
     uint8 nextRound = dispute.currentRound + 1;
     uint8 contribdata = paramsToContribdata(false, _party);
     dispute.nContributions++;
@@ -487,34 +494,28 @@ contract SlotCurate is IArbitrable {
     uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
-    require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
-    require(block.timestamp < uint(dispute.timestamp + settings.fundingPeriod), "Over funding period");
+    require(dispute.state == DisputeState.Used, "Dispute has to be Used");
+    
+    _verifyUnderAppealDeadline(dispute, settings.arbitrator);
     
     bytes memory arbitratorExtraData = bytes.concat(settings.arbitratorExtraData1, settings.arbitratorExtraData2);
     uint appealCost = settings.arbitrator.appealCost(dispute.arbitratorDisputeId, arbitratorExtraData);
     uint totalAmountNeeded = appealCost * settings.multiplier / DIVIDER;
 
     // make sure you have the required amount
-    uint currentAmount = decompressAmount(roundContributionsMap[_disputeSlot][nextRound].partyTotal[0] + roundContributionsMap[_disputeSlot][nextRound].partyTotal[1]);
+    uint currentAmount = decompressAmount(
+      roundContributionsMap[_disputeSlot][nextRound].partyTotal[0] +
+      roundContributionsMap[_disputeSlot][nextRound].partyTotal[1]
+    );
     require(currentAmount >= totalAmountNeeded, "Not enough to fund round");
-    // mmm............
-    // apparently I have to do something related to "currentRuling"....
-    // TODO
+    
+    // got enough, it's legit to do so. I can appeal, lets appeal
+    settings.arbitrator.appeal
+      {value: appealCost}
+      (dispute.arbitratorDisputeId, arbitratorExtraData);
 
-    /*
-      ok, at a high level this is how it works:
-      whenever people make settings, make sure settings.fundingPeriod is > rulingPeriod of arbor
-      disputestatus.RULING doesnt exist anymore. just let people contribute even if
-      theres not an updated ruling yet. even if they're disputing, why wait?
-      this is because you cant get period from arble.
-
-    */
-
-    // bs event to make VS Code shut up. TODO.
-    emit RequestAccepted(uint64(currentAmount));
-    // and then you call the function of the arbitrator with value equal to "actualAmount"
-    // plus a few gwei, because we're may be losing to rounding errors.
-    // or we could make contributors pay slightly more gwei just to always be on the safe side.
+    // you may to emit an event for this. but there's no need
+    // arbitrator will surely do it for you
   }
 
   function executeRuling(uint64 _disputeSlot) public {
@@ -523,7 +524,7 @@ contract SlotCurate is IArbitrable {
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
     //   2. make sure that disputeSlot has an ongoing dispute
-    require(dispute.state == DisputeState.Funding, "Can only be executed in Funding");
+    require(dispute.state == DisputeState.Used, "Can only be executed if Used");
     //    3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
     StoredRuling memory storedRuling = storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
     require(storedRuling.ruled, "Wasn't ruled by the arbitrator");
@@ -575,6 +576,18 @@ contract SlotCurate is IArbitrable {
             just pick up their reward. someone can create new settings, edit
             the settings of the list and then remove the item, so there's a workaround.
         */
+  }
+
+  // PRIVATE FUNCTIONS
+
+  // reverts if not under appealDeadline
+  function _verifyUnderAppealDeadline(Dispute storage _dispute, IArbitrator _arbitrator) private {
+    if (block.timestamp >= _dispute.appealDeadline) {
+      // you're over it. get updated appealPeriod
+      (, uint end) = _arbitrator.appealPeriod(_dispute.arbitratorDisputeId);
+      require(block.timestamp < end, "Over submision period");
+      _dispute.appealDeadline = uint40(end);
+    }
   }
 
   // VIEW FUNCTIONS
