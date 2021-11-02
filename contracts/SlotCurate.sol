@@ -336,11 +336,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 evidenceGroupID = uint256(keccak256(abi.encodePacked(_slotIndex, _disputeSlot))); // TODO: Decide on evidenceGroupID. We should group evidence by per item and per request.
     uint256 metaEvidenceID = ((3 * settingsCount) + uint48(processType)); // Having a different metaevidence for add, remove and update operations (processType).
     emit Dispute(IArbitrator(settings.arbitrator), uint256(_disputeSlot), metaEvidenceID, evidenceGroupID);
-
-    if (msg.value > arbitrationCost) {
-      // Send excess value back.
-      payable(msg.sender).send(msg.value - arbitrationCost);
-    }
   }
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
