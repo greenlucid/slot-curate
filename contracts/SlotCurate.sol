@@ -428,8 +428,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
 
-    uint256 evidenceGroupID = uint256(keccak256(abi.encodePacked(dispute.slotId, _disputeSlot)));
-    emit Evidence(IArbitrator(settings.arbitrator), evidenceGroupID, msg.sender, _evidenceURI); // We use _questionID for evidence group identifier.
+    emit Evidence(IArbitrator(settings.arbitrator), dispute.arbitratorDisputeId, msg.sender, _evidenceURI);
   }
 
   function withdrawRewards(uint64 _disputeSlot) private {
