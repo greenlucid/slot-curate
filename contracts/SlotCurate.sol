@@ -179,6 +179,13 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     if you get something different, you check if you're under "end".
     if so, rewrite appealDeadline with end.
     otherwise, revert.
+
+    actually i dont need to store uint256 rulings XD
+    (in curate) there are only 3 possible rulings.
+    just store it in a single slot.
+
+    remember to make "withdrawRoundZero". unsure if I already wrote this down.
+    
 */
 
 contract SlotCurate is IArbitrable {
@@ -260,8 +267,8 @@ contract SlotCurate is IArbitrable {
   }
 
   struct StoredRuling {
-    uint256 ruling;
-    bool ruled; // this bit costs 20k gas (ferit: bool is uint8 under the hood, don't forget.)
+    uint248 ruling;
+    bool ruled;
   }
 
   // EVENTS //
@@ -293,7 +300,7 @@ contract SlotCurate is IArbitrable {
   // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
   mapping(uint48 => Settings) internal settingsMap;
   mapping(uint64 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
-  // totalContributions[disputeId][round][Party]
+  // totalContributions[disputeSlot][round][Party]
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(address => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
 
@@ -480,7 +487,7 @@ contract SlotCurate is IArbitrable {
     _verifyUnderAppealDeadline(dispute, settings.arbitrator);
 
     uint8 nextRound = dispute.currentRound + 1;
-    uint8 contribdata = paramsToContribdata(false, _party);
+    uint8 contribdata = paramsToContribdata(true, _party);
     dispute.nContributions++;
     dispute.pendingWithdraws++;
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
@@ -548,8 +555,82 @@ contract SlotCurate is IArbitrable {
   function rule(uint256 _disputeId, uint256 _ruling) external override {
     // no need to check if already ruled, every arbitrator is trusted.
     // arbitrators that "cheat" don't matter, no one will use them.
-    storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: _ruling, ruled: true});
+    storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: uint248(_ruling), ruled: true});
     emit Ruling(IArbitrator(msg.sender), _disputeId, _ruling);
+  }
+
+  function withdrawOneContribution(uint64 _disputeSlot, uint64 _contributionSlot) public {
+    // check if dispute is used.
+    Dispute storage dispute = disputes[_disputeSlot];
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    // withdrawAllRewards does not set the flag on "withdrawn" individually.
+    // that's why you check for dispute as well.
+    require(dispute.state == DisputeState.Used, "Dispute must be in use");
+    require(dispute.nContributions > _contributionSlot, "Dispute lacks that contrib");
+    // to check if dispute is really over. 
+    StoredRuling storage storedRuling = 
+      storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+    require(storedRuling.ruled, "Dispute hasn't been ruled");
+
+    Contribution storage contribution = contributions[_disputeSlot][_contributionSlot];
+    (bool pendingWithdrawal, Party party) = contribdataToParams(contribution.contribdata);
+
+    require(pendingWithdrawal, "Contribution withdrawn already");
+
+    // okay, all checked. let's get the contribution.
+
+    RoundContributions memory roundContributions =
+      roundContributionsMap[_disputeSlot][contribution.round];
+
+    if (roundContributions.appealCost != 0) {
+      // then this is a contribution from an appealed round.
+      // only winner party can withdraw.
+      require(partyWonContribution(party, storedRuling.ruling), "Your side lost the dispute");
+
+      uint spoils = decompressAmount(
+        roundContributions.partyTotal[0]
+        + roundContributions.partyTotal[1]
+        - roundContributions.appealCost
+      );
+      uint share = spoils 
+        * uint(contribution.amount)
+        / uint(roundContributions.partyTotal[uint(party)]);
+
+      payable(contribution.contributor).transfer(share);
+    } else {
+      // this is a contrib from a round that didnt get appealed.
+      // just refund the same amount
+      uint refund = decompressAmount(contribution.amount);
+      payable(contribution.contributor).transfer(refund);
+    }    
+  }
+
+  function withdrawRoundZero(uint64 _disputeSlot) public {
+    // "round zero" refers to the initial requester, challenger stake.
+    // it's not stored like the other contributions.
+    // TODO
+    // check if dispute is used.
+    Dispute storage dispute = disputes[_disputeSlot];
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    // withdrawAllRewards does not set the flag on "withdrawn" individually.
+    // that's why you check for dispute as well.
+    require(dispute.state == DisputeState.Used, "Dispute must be in use");
+    // to check if dispute is really over. 
+    StoredRuling storage storedRuling = 
+      storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+    require(storedRuling.ruled, "Dispute hasn't been ruled");
+  }
+
+  function withdrawAllContributions(uint64 _disputeSlot) public {
+    // check if dispute is used.
+    Dispute storage dispute = disputes[_disputeSlot];
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    // withdrawAllRewards does not set the flag on "withdrawn" individually.
+    // that's why you check for dispute as well.
+    require(dispute.state == DisputeState.Used, "Dispute must be in use");
   }
 
   function withdrawRewards(uint64 _disputeSlot) private {
@@ -686,23 +767,23 @@ contract SlotCurate is IArbitrable {
     return (used, disputed, processType);
   }
 
-  function paramsToContribdata(bool _withdrawn, Party _party) public pure returns (uint8) {
-    uint8 withdrawnAddend;
-    if (_withdrawn) withdrawnAddend = 128;
+  function paramsToContribdata(bool _pendingWithdrawal, Party _party) public pure returns (uint8) {
+    uint8 pendingWithdrawalAddend;
+    if (_pendingWithdrawal) pendingWithdrawalAddend = 128;
     uint8 partyAddend;
     if (_party == Party.Challenger) partyAddend = 64;
 
-    uint8 contribdata = withdrawnAddend + partyAddend;
+    uint8 contribdata = pendingWithdrawalAddend + partyAddend;
     return contribdata;
   }
 
   function contribdataToParams(uint8 _contribdata) public pure returns (bool, Party) {
-    uint8 withdrawnAddend = _contribdata & 128;
-    bool withdrawn = withdrawnAddend != 0;
+    uint8 pendingWithdrawalAddend = _contribdata & 128;
+    bool pendingWithdrawal = pendingWithdrawalAddend != 0;
     uint8 partyAddend = _contribdata & 64;
     Party party = Party(partyAddend >> 6);
 
-    return (withdrawn, party);
+    return (pendingWithdrawal, party);
   }
 
   // always compress / decompress rounding down. 
@@ -712,5 +793,16 @@ contract SlotCurate is IArbitrable {
 
   function decompressAmount(uint80 _compressedAmount) public pure returns (uint) {
     return (uint(_compressedAmount) << AMOUNT_BITSHIFT);
+  }
+
+  function partyWonContribution(Party _party, uint248 _ruling) public pure returns (bool) {
+    // if requester, either 0 or 1 means you won.
+    // if challenger, 2 means you won.
+    // low level without branches to decrease gas
+    return(
+      (_party == Party.Requester && (_ruling == 0 || _ruling == 1))
+      ||
+      (_party == Party.Challenger && _ruling == 2)
+    );
   }
 }
