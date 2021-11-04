@@ -370,15 +370,6 @@ contract SlotCurate is IArbitrable {
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
 
-  // you could add an "emergency" boolean option.
-  // if on, and the chosen slotIndex is taken, it will look for the first unused slot and create there instead.
-  // otherwise, the transaction fails. it's important to have it optional this since there could potentially be a lot of
-  // taken slots.
-  // but its important to have to option as safeguard in case frontrunners try to inhibit the protocol.
-  // another way is making a separate wrapper public function for this, that calls the two main ones
-  // (make one for add and another for remove. and another one for challenging (to get free dispute slot))
-  // TODO solve with wrapper functions
-
   // in the contract, listIndex and settingsId are trusted.
   // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
   // then item will be ignored or marked as invalid.
@@ -393,7 +384,13 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    _addItem(_listIndex, _settingsId, _idSlot, _ipfsUri, slot);
+    // used: true, disputed: false, processType: Add 
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
+    slot.slotdata = slotdata;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
   }
 
   // frontrunning protection
@@ -404,10 +401,7 @@ contract SlotCurate is IArbitrable {
     string memory _ipfsUri
   ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    Slot storage slot = slots[workSlot];
-    Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    _addItem(_listIndex, _settingsId, workSlot, _ipfsUri, slot);
+    addItem(_listIndex, _settingsId, workSlot, _ipfsUri);
   }
 
   // list is checked in subgraph. settings is trusted here.
@@ -425,7 +419,13 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    _removeItem(_workSlot, _settingsId, _idSlot, _idRequestTime, slot);
+    // used: true, disputed: false, processType: Removal 
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
+    slot.slotdata = slotdata;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
   function removeItemInFirstFreeSlot(
@@ -435,10 +435,7 @@ contract SlotCurate is IArbitrable {
     uint40 _idRequestTime
   ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    Slot storage slot =slots[workSlot];
-    Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    _removeItem(workSlot, _settingsId, _idSlot, _idRequestTime, slot);
+    removeItem(workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
   function editItem(
@@ -452,15 +449,23 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    _editItem(_workSlot, _settingsId, _idSlot, _idRequestTime, slot);
+    // used: true, disputed: false, processType: Edit
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
+    slot.slotdata = slotdata;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
-  function editItemInFirstFreeSlot(uint64 _fromSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
+  function editItemInFirstFreeSlot(
+    uint64 _fromSlot,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    uint40 _idRequestTime
+  ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    Slot storage slot =slots[workSlot];
-    Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    _editItem(workSlot, _settingsId, _idSlot, _idRequestTime, slot);
+    editItem(workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
   function executeRequest(uint64 _slotIndex) public {
@@ -625,7 +630,7 @@ contract SlotCurate is IArbitrable {
     if (roundContributions.appealCost != 0) {
       // then this is a contribution from an appealed round.
       // only winner party can withdraw.
-      require(partyWonContribution(party, storedRuling.ruling), "Your side lost the dispute");
+      require(party == whichPartyWon(storedRuling.ruling), "That side lost the dispute");
 
       uint spoils = decompressAmount(
         roundContributions.partyTotal[0]
@@ -738,55 +743,6 @@ contract SlotCurate is IArbitrable {
   }
 
   // PRIVATE FUNCTIONS
-
-
-  function _addItem(
-    uint64 _listIndex,
-    uint48 _settingsId,
-    uint64 _idSlot,
-    string memory _ipfsUri,
-    Slot storage _slot
-  ) private {
-    // used: true, disputed: false, processType: Add 
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
-    _slot.slotdata = slotdata;
-    _slot.requestTime = uint40(block.timestamp);
-    _slot.requester = msg.sender;
-    _slot.settingsId = _settingsId;
-    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
-  }
-
-  function _removeItem(
-    uint64 _workSlot,
-    uint48 _settingsId,
-    uint64 _idSlot,
-    uint40 _idRequestTime,
-    Slot storage _slot
-  ) private {
-    // used: true, disputed: false, processType: Removal 
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
-    _slot.slotdata = slotdata;
-    _slot.requestTime = uint40(block.timestamp);
-    _slot.requester = msg.sender;
-    _slot.settingsId = _settingsId;
-    emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
-  }
-
-  function _editItem(
-    uint64 _workSlot,
-    uint48 _settingsId,
-    uint64 _idSlot,
-    uint40 _idRequestTime,
-    Slot storage _slot
-  ) private {
-    // used: true, disputed: false, processType: Edit
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
-    _slot.slotdata = slotdata;
-    _slot.requestTime = uint40(block.timestamp);
-    _slot.requester = msg.sender;
-    _slot.settingsId = _settingsId;
-    emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
-  }
 
   // can mutate storage. reverts if not under appealDeadline
   function _verifyUnderAppealDeadline(Dispute storage _dispute, IArbitrator _arbitrator) private {
@@ -970,17 +926,6 @@ contract SlotCurate is IArbitrable {
 
   function decompressAmount(uint80 _compressedAmount) public pure returns (uint) {
     return (uint(_compressedAmount) << AMOUNT_BITSHIFT);
-  }
-
-  function partyWonContribution(Party _party, uint248 _ruling) public pure returns (bool) {
-    // if requester, either 0 or 1 means you won.
-    // if challenger, 2 means you won.
-    // low level without branches to decrease gas
-    return(
-      (_party == Party.Requester && (_ruling == 0 || _ruling == 1))
-      ||
-      (_party == Party.Challenger && _ruling == 2)
-    );
   }
 
   // thanks to this func we could possibly do without the above func.
