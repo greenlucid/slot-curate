@@ -286,7 +286,7 @@ contract SlotCurate is IArbitrable {
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
   // this will be bad in rollups
-  event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _slotIndex, string _ipfsUri);
+  event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _idSlot, string _ipfsUri);
   event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
   event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
@@ -376,10 +376,10 @@ contract SlotCurate is IArbitrable {
   function addItem(
     uint64 _listIndex,
     uint48 _settingsId,
-    uint64 _slotIndex,
+    uint64 _idSlot,
     string memory _ipfsUri
   ) public payable {
-    Slot storage slot = slots[_slotIndex];
+    Slot storage slot = slots[_idSlot];
     (bool used, , ) = slotdataToParams(slot.slotdata);
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
@@ -391,7 +391,17 @@ contract SlotCurate is IArbitrable {
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
     // I don't remember why I removed the trusted settingsId emission before. review this.
-    emit ItemAddRequest(_listIndex, _settingsId, _slotIndex, _ipfsUri);
+    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
+  }
+
+  function addItemInFirstFreeSlot(
+    uint64 _listIndex,
+    uint48 _settingsId,
+    uint64 _fromSlot,
+    string memory _ipfsUri
+  ) public payable {
+    uint64 workSlot = firstFreeSlot(_fromSlot);
+    addItem(_listIndex, _settingsId, workSlot, _ipfsUri);
   }
 
   // list is checked in subgraph. settings is trusted here.
@@ -418,6 +428,16 @@ contract SlotCurate is IArbitrable {
     emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
+  function removeItemInFirstFreeSlot(
+    uint64 _fromSlot,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    uint40 _idRequestTime
+  ) public payable {
+    uint64 workSlot = firstFreeSlot(_fromSlot);
+    removeItem(workSlot, _settingsId, _idSlot, _idRequestTime);
+  }
+
   function editItem(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
     Slot storage slot = slots[_workSlot];
     (bool used, , ) = slotdataToParams(slot.slotdata);
@@ -431,6 +451,11 @@ contract SlotCurate is IArbitrable {
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
     emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+  }
+
+  function editItemInFirstFreeSlot(uint64 _fromSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
+    uint64 workSlot = firstFreeSlot(_fromSlot);
+    editItem(workSlot, _settingsId, _idSlot, _idRequestTime);
   }
 
   function executeRequest(uint64 _slotIndex) public {
@@ -480,6 +505,11 @@ contract SlotCurate is IArbitrable {
     dispute.appealDeadline = 0;
     dispute.roundZeroCost = compressAmount(arbitrationCost);
     dispute.freeSpace2 = 1; // to make sure slot never goes to zero.
+  }
+
+  function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot) public payable {
+    uint64 disputeWorkSlot = firstFreeDisputeSlot(_fromSlot);
+    challengeRequest( _slotIndex, disputeWorkSlot);
   }
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
@@ -766,7 +796,15 @@ contract SlotCurate is IArbitrable {
     uint64 i = _startPoint;
     // this is used == true, because if used, slotdata is of shape 1xxx0000, so it's larger than 127
     while (slots[i].slotdata > 127) {
-      i = i + 1;
+      i++;
+    }
+    return i;
+  }
+
+  function firstFreeDisputeSlot(uint64 _startPoint) public view returns (uint64) {
+    uint64 i = _startPoint;
+    while (disputes[i].state == DisputeState.Used) {
+      i++;
     }
     return i;
   }
