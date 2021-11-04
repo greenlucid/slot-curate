@@ -301,8 +301,12 @@ contract SlotCurate is IArbitrable {
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
   event RequestAccepted(uint64 _slotIndex);
   event RequestRejected(uint64 _slotIndex);
+  event WhitelistChange(address _arbitrator, bool _status);
+  event GovernorChange(address _governor);
 
   // CONTRACT STORAGE //
+
+  address internal governor; // governor can whitelist arbitrators.
   uint64 internal listCount;
   uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
 
@@ -315,6 +319,11 @@ contract SlotCurate is IArbitrable {
   // totalContributions[disputeSlot][round][Party]
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(address => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
+  mapping(address => bool) internal arbitratorsWhitelist; // to restrict reusing disputeSlots. you don't need to be in for creating new.
+
+  constructor(address _governor) {
+    governor = _governor;
+  }
 
   // PUBLIC FUNCTIONS
 
@@ -470,8 +479,8 @@ contract SlotCurate is IArbitrable {
 
   function executeRequest(uint64 _slotIndex) public {
     Slot storage slot = slots[_slotIndex];
-    require(slotIsExecutable(slot), "Slot cannot be executed");
     Settings storage settings = settingsMap[slot.settingsId];
+    require(slotIsExecutable(slot, settings.requestPeriod), "Slot cannot be executed");
     payable(slot.requester).transfer(settings.requesterStake);
     emit RequestAccepted(_slotIndex);
     // used to false, others don't matter.
@@ -480,12 +489,17 @@ contract SlotCurate is IArbitrable {
 
   function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
     Slot storage slot = slots[_slotIndex];
-    require(slotCanBeChallenged(slot), "Slot cannot be challenged");
     Settings storage settings = settingsMap[slot.settingsId];
+    require(slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
     require(msg.value >= settings.challengerStake, "Not enough to cover stake");
     
     Dispute storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Free, "That dispute slot is being used");
+
+    if (dispute.challenger != address(0)) {
+      // non-virgin dispute slot.
+      require(arbitratorsWhitelist[address(settings.arbitrator)], "Cannot reuse, not in whitelist");
+    }
 
     // it will be challenged now
 
@@ -632,16 +646,7 @@ contract SlotCurate is IArbitrable {
       // only winner party can withdraw.
       require(party == whichPartyWon(storedRuling.ruling), "That side lost the dispute");
 
-      uint spoils = decompressAmount(
-        roundContributions.partyTotal[0]
-        + roundContributions.partyTotal[1]
-        - roundContributions.appealCost
-      );
-      uint share = spoils 
-        * uint(contribution.amount)
-        / uint(roundContributions.partyTotal[uint(party)]);
-
-      payable(contribution.contributor).transfer(share);
+      _withdrawSingleReward(contribution, roundContributions, party);
     } else {
       // this is a contrib from a round that didnt get appealed.
       // just refund the same amount
@@ -742,6 +747,20 @@ contract SlotCurate is IArbitrable {
     dispute.state = DisputeState.Free;
   }
 
+  // governor functions
+
+  function changeWhitelist(address _arbitrator, bool _status) public {
+    require(msg.sender == governor, "Only governor changes this");
+    arbitratorsWhitelist[_arbitrator] = _status;
+    emit WhitelistChange(_arbitrator, _status);
+  }
+
+  function changeGovernor(address _governor) public {
+    require(msg.sender == governor, "Only governor changes this");
+    governor = _governor;
+    emit GovernorChange(_governor);
+  }
+
   // PRIVATE FUNCTIONS
 
   // can mutate storage. reverts if not under appealDeadline
@@ -819,17 +838,17 @@ contract SlotCurate is IArbitrable {
     return i;
   }
 
-  function slotIsExecutable(Slot memory _slot) public view returns (bool) {
+  function slotIsExecutable(Slot memory _slot, uint40 requestPeriod) public view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used
-      && (block.timestamp > _slot.requestTime + settingsMap[_slot.settingsId].requestPeriod)
+      && (block.timestamp > _slot.requestTime + requestPeriod)
       && !disputed;
   }
 
-  function slotCanBeChallenged(Slot memory _slot) public view returns (bool) {
+  function slotCanBeChallenged(Slot memory _slot, uint40 requestPeriod) public view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used
-      && !(block.timestamp > _slot.requestTime + settingsMap[_slot.settingsId].requestPeriod)
+      && !(block.timestamp > _slot.requestTime + requestPeriod)
       && !disputed;
   }
 
