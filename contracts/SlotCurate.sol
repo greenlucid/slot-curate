@@ -819,49 +819,18 @@ contract SlotCurate is IArbitrable {
     return i;
   }
 
-  // debugging purposes, for now. shouldn't be too expensive and could be useful in future, tho
-  // doesn't actually "count" the slots, just checks until there's a virgin slot
-  // it's the same as "maxSlots" in the notes
-  function firstVirginSlotFrom(uint64 _startPoint) public view returns (uint64) {
-    uint64 i = _startPoint;
-    while (slots[i].requester != address(0)) {
-      i = i + 1;
-    }
-    return i;
-  }
-
-  // this is prob bloat. based on the idea of generating a random free slot, to avoid collisions.
-  // could be used to advice the users to wait until there's free slot for gas savings.
-  function countFreeSlots() public view returns (uint64) {
-    uint64 slotCount = firstVirginSlotFrom(0);
-    uint64 i = 0;
-    uint64 freeSlots = 0;
-    for (; i < slotCount; i++) {
-      Slot storage slot = slots[i];
-      // !slot.used ; so slotdata is smaller than 128
-      if (slot.slotdata < 128) {
-        freeSlots++;
-      }
-    }
-    return freeSlots;
-  }
-
-  function viewSlot(uint64 _slotIndex) public view returns (Slot memory) {
-    return slots[_slotIndex];
-  }
-
   function slotIsExecutable(Slot memory _slot) public view returns (bool) {
-    Settings storage settings = settingsMap[_slot.settingsId];
-    bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
-    return used && overRequestPeriod && !disputed;
+    return used
+      && (block.timestamp > _slot.requestTime + settingsMap[_slot.settingsId].requestPeriod)
+      && !disputed;
   }
 
   function slotCanBeChallenged(Slot memory _slot) public view returns (bool) {
-    Settings storage settings = settingsMap[_slot.settingsId];
-    bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
-    return used && !overRequestPeriod && !disputed;
+    return used
+      && !(block.timestamp > _slot.requestTime + settingsMap[_slot.settingsId].requestPeriod)
+      && !disputed;
   }
 
   function paramsToSlotdata(
