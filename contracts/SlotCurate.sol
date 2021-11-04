@@ -44,7 +44,7 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
 
     if needed, you can store eth amounts as uint64.
     rationale: uint88 is enough to index all current wei
-    put an extra byte to be in the same side. uint96.
+    put an extra byte to be in the safe side. uint96.
     discard the 4 gwei residue. it's uint64 now.
 
     ok, i have to save the total amount contributed per side per round.
@@ -254,7 +254,11 @@ contract SlotCurate is IArbitrable {
   }
 
   struct Contribution {
-    uint8 round; // could be bigger, there's enough space by shifting amount.
+    uint8 round; // could be bigger. but because exp cost, shouldn't be needed.
+    // if you have a bool "firstOfRound" instead.
+    // you could save 1 byte
+    // but would make withdrawOneContribution O(n) because rewards are distributed
+    // round wise
     uint8 contribdata; // compressed form of bool withdrawn, Party party.
     uint80 amount; // to be raised 32 bits.
     address contributor; // could be compressed to 64 bits, but there's no point.
@@ -267,8 +271,9 @@ contract SlotCurate is IArbitrable {
   }
 
   struct StoredRuling {
-    uint248 ruling;
+    uint240 ruling;
     bool ruled;
+    bool executed;
   }
 
   // EVENTS //
@@ -278,11 +283,9 @@ contract SlotCurate is IArbitrable {
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
   event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, address _arbitrator);
   // why emit settingsId in the request events?
-  // it's cheaper to trust the settingsId in the contract, than get it from the list and verifying X
-  // which I don't remember... TODO recheck this. look into getting it from list without verifying.
-  // this would entail again, verifying that list exists in the subgraph, or whatever.
-  // the subgraph can check the list at that time and ignore requests with invalid thing.
-  // so that the result of the dispute is meaningless for Curate................
+  // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
+  // the subgraph can check the list at that time and ignore requests with invalid settings.
+  // this will be bad in rollups
   event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _slotIndex, string _ipfsUri);
   event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
   event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
@@ -365,6 +368,7 @@ contract SlotCurate is IArbitrable {
   // but its important to have to option as safeguard in case frontrunners try to inhibit the protocol.
   // another way is making a separate wrapper public function for this, that calls the two main ones
   // (make one for add and another for remove. and another one for challenging (to get free dispute slot))
+  // TODO solve with wrapper functions
 
   // in the contract, listIndex and settingsId are trusted.
   // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
@@ -530,13 +534,14 @@ contract SlotCurate is IArbitrable {
     Dispute storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
-    //   2. make sure that disputeSlot has an ongoing dispute
+    // 2. make sure that disputeSlot has an ongoing dispute
     require(dispute.state == DisputeState.Used, "Can only be executed if Used");
-    //    3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
-    StoredRuling memory storedRuling = storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+    // 3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
+    StoredRuling storage storedRuling = storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
     require(storedRuling.ruled, "Wasn't ruled by the arbitrator");
-    //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
-    //    default to requester, in that case.
+    require(!storedRuling.executed, "Has already been executed");
+    // 4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
+    // default to requester, in that case.
     // 0 refuse, 1 requester, 2 challenger.
     if (storedRuling.ruling == 1 || storedRuling.ruling == 0) {
       // requester won.
@@ -545,17 +550,16 @@ contract SlotCurate is IArbitrable {
       // challenger won.
       emit RequestRejected(dispute.slotId);
     }
-    // 5. withdraw rewards
-    withdrawRewards(_disputeSlot);
-    // 6. dispute and slot are now Free.. other slotdata doesn't matter.
+    // 5. slot is now Free.. other slotdata doesn't matter.
     slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
-    dispute.state = DisputeState.Free; // to avoid someone withdrawing rewards twice.
+    storedRuling.executed = true; // to avoid someone from calling this again.
+    // dispute is intentionally left alone. wont be freed until withdrawn contribs.
   }
 
   function rule(uint256 _disputeId, uint256 _ruling) external override {
     // no need to check if already ruled, every arbitrator is trusted.
     // arbitrators that "cheat" don't matter, no one will use them.
-    storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: uint248(_ruling), ruled: true});
+    storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: uint240(_ruling), ruled: true, executed: false});
     emit Ruling(IArbitrator(msg.sender), _disputeId, _ruling);
   }
 
@@ -571,7 +575,7 @@ contract SlotCurate is IArbitrable {
     // to check if dispute is really over. 
     StoredRuling storage storedRuling = 
       storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
-    require(storedRuling.ruled, "Dispute hasn't been ruled");
+    require(storedRuling.ruled && storedRuling.executed, "Must be ruled and executed");
 
     Contribution storage contribution = contributions[_disputeSlot][_contributionSlot];
     (bool pendingWithdrawal, Party party) = contribdataToParams(contribution.contribdata);
@@ -603,27 +607,50 @@ contract SlotCurate is IArbitrable {
       // just refund the same amount
       uint refund = decompressAmount(contribution.amount);
       payable(contribution.contributor).transfer(refund);
-    }    
+    }
+
+    if (dispute.pendingWithdraws == 1 && !dispute.pendingInitialWithdraw) {
+      // this was last contrib remaining
+      // no need to decrement pendingWithdraws if last. save gas.
+      dispute.state = DisputeState.Free;
+    } else {
+      dispute.pendingWithdraws--;
+    }
   }
 
   function withdrawRoundZero(uint64 _disputeSlot) public {
     // "round zero" refers to the initial requester, challenger stake.
     // it's not stored like the other contributions.
-    // TODO
-    // check if dispute is used.
     Dispute storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
-    // withdrawAllRewards does not set the flag on "withdrawn" individually.
-    // that's why you check for dispute as well.
+    
     require(dispute.state == DisputeState.Used, "Dispute must be in use");
     // to check if dispute is really over. 
     StoredRuling storage storedRuling = 
       storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
-    require(storedRuling.ruled, "Dispute hasn't been ruled");
+    require(storedRuling.ruled && storedRuling.executed, "Must be ruled and executed");
+    require(dispute.pendingInitialWithdraw, "Round zero was already withdrawn");
+
+    // withdraw it. this can be put onto its own private func.
+
+    Party party = whichPartyWon(storedRuling.ruling);
+    _withdrawRoundZero(dispute, settings, slot, party);
+
+    if (dispute.pendingWithdraws == 0) {
+      dispute.state = DisputeState.Free;
+    } else {
+      dispute.pendingInitialWithdraw = false;
+    }
   }
 
   function withdrawAllContributions(uint64 _disputeSlot) public {
+    // this func is a "public good". it uses less gas overall to withdraw all
+    // contribs. because you only need to change 1 single flag.
+    // it also frees the dispute slot.
+    // if frequent users set up a multisig, or some way to call it,
+    // it would be cheaper in the long run.
+
     // check if dispute is used.
     Dispute storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
@@ -631,32 +658,48 @@ contract SlotCurate is IArbitrable {
     // withdrawAllRewards does not set the flag on "withdrawn" individually.
     // that's why you check for dispute as well.
     require(dispute.state == DisputeState.Used, "Dispute must be in use");
-  }
+    StoredRuling storage storedRuling = 
+      storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+    require(storedRuling.ruled && storedRuling.executed, "Must be ruled and executed");
+    Party winningParty = whichPartyWon(storedRuling.ruling);
+    uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
+    // this is a separate func to make it more efficient.
+    // there are three contribs that are handled differently:
+    // 1. the round zero
+    if (dispute.pendingInitialWithdraw) {
+      _withdrawRoundZero(dispute, settings, slot, winningParty);
+    }
+    // 2. then, the contribs of...
+    uint64 contribSlot = 0;
+    uint8 currentRound = 1;
+    RoundContributions memory roundContributions =
+      roundContributionsMap[_disputeSlot][currentRound];
+    // 2.1. the fully funded and appealed rounds
+    // withdraw to pending winners
+    while (contribSlot < dispute.nContributions) {
+      Contribution memory contribution = contributions[_disputeSlot][contribSlot];
+      if (contribution.round != currentRound) {
+        roundContributions = 
+          roundContributionsMap[_disputeSlot][contribution.round];
+        currentRound = contribution.round;
+      }
+      if (currentRound > dispute.currentRound) break;
 
-  function withdrawRewards(uint64 _disputeSlot) private {
-    // todo
-    /*
-            withdraw rewards
-            ok whats the deal with this
-            do arbitrator remember the fees they have for each dispute? is it different for each dispute?
-            because this is pretty important actually
-            if it doesn't remember, even if I query for fees every single time (which is super inefficient)
-            I would be fucked up
+      if (contribution.contribdata == pendingAndWinnerContribdata) {
+        _withdrawSingleReward(contribution, roundContributions, winningParty);
+      }
+      contribSlot++;
+    }
 
-            if they remember, you'd need to ask for fees:
-            - when challenging
-            - when withdrawing rewards, to substract the total cost of the dispute.
-            (or, you could store the total cost somewhere in the dispute data.)
-            - when advancing to next round.
-
-            edge case:
-            some settings don't work anymore
-            because arbitrator changes fees while there's a submitted item
-            and the submitter stake and challenger stake no longer cover the dispute, so it cannot start.
-            in that case, we could revert and make it impossible to challenge. e.g. let submitter
-            just pick up their reward. someone can create new settings, edit
-            the settings of the list and then remove the item, so there's a workaround.
-        */
+    // 2.2. the last, unnappealed round
+    while (contribSlot < dispute.nContributions) {
+      // refund every transaction
+      Contribution memory contribution = contributions[_disputeSlot][contribSlot];
+      _refundContribution(contribution);
+      contribSlot++;
+    }
+    // afterwards, set the dispute slot to Free.
+    dispute.state = DisputeState.Free;
   }
 
   // PRIVATE FUNCTIONS
@@ -669,6 +712,48 @@ contract SlotCurate is IArbitrable {
       require(block.timestamp < end, "Over submision period");
       _dispute.appealDeadline = uint40(end);
     }
+  }
+
+  function _withdrawRoundZero(
+    Dispute storage _dispute,
+    Settings storage _settings,
+    Slot storage _slot,
+    Party _party
+  ) private {
+    // this method is already told who won.
+    uint spoils = decompressAmount(
+      _settings.requesterStake
+      + _settings.challengerStake
+      - _dispute.roundZeroCost
+    );
+    if (_party == Party.Requester) {
+      payable(_slot.requester).transfer(spoils);
+    } else if (_party == Party.Challenger) {
+      payable(_dispute.challenger).transfer(spoils);
+    }
+  }
+
+  function _withdrawSingleReward(
+    Contribution memory _contribution,
+    RoundContributions memory _roundContributions,
+    Party _winningParty
+  ) private {
+    uint spoils = decompressAmount(
+        _roundContributions.partyTotal[0]
+        + _roundContributions.partyTotal[1]
+        - _roundContributions.appealCost
+      );
+    uint share = spoils 
+      * uint(_contribution.amount)
+      / uint(_roundContributions.partyTotal[uint(_winningParty)]);
+    payable(_contribution.contributor).transfer(share);
+  }
+
+  function _refundContribution(
+    Contribution memory _contribution
+  ) private {
+    uint refund = decompressAmount(_contribution.amount);
+    payable(_contribution.contributor).transfer(refund);
   }
 
   // VIEW FUNCTIONS
@@ -804,5 +889,14 @@ contract SlotCurate is IArbitrable {
       ||
       (_party == Party.Challenger && _ruling == 2)
     );
+  }
+
+  // thanks to this func we could possibly do without the above func.
+  function whichPartyWon(uint248 _ruling) public pure returns (Party) {
+    if (_ruling == 0 || _ruling == 1) {
+      return Party.Requester;
+    } else {
+      return Party.Challenger;
+    }
   }
 }
