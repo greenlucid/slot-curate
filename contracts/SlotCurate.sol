@@ -185,6 +185,15 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     just store it in a single slot.
 
     remember to make "withdrawRoundZero". unsure if I already wrote this down.
+
+    i think you could get away with not reading settings for requesterStake
+    if instead you read the msg.value from the event and check yourself if it matches the required amount
+    if it doesn't, ignore it in subgraph and frontend
+    whoever chooses to interact with it, it's at risk.
+    mm... that may force to save amount somewhere, like the slot
+    otherwise if it gets "resolved" then the requester can drain value
+    i dont think that is feasible
+    (check later how much would this save. if it's over 1k gas, consider.)
     
 */
 
@@ -384,16 +393,10 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Add 
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
-    slot.slotdata = slotdata;
-    slot.requestTime = uint40(block.timestamp);
-    slot.requester = msg.sender;
-    slot.settingsId = _settingsId;
-    // I don't remember why I removed the trusted settingsId emission before. review this.
-    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
+    _addItem(_listIndex, _settingsId, _idSlot, _ipfsUri, slot);
   }
 
+  // frontrunning protection
   function addItemInFirstFreeSlot(
     uint64 _listIndex,
     uint48 _settingsId,
@@ -401,7 +404,10 @@ contract SlotCurate is IArbitrable {
     string memory _ipfsUri
   ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    addItem(_listIndex, _settingsId, workSlot, _ipfsUri);
+    Slot storage slot = slots[workSlot];
+    Settings storage settings = settingsMap[_settingsId];
+    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    _addItem(_listIndex, _settingsId, workSlot, _ipfsUri, slot);
   }
 
   // list is checked in subgraph. settings is trusted here.
@@ -419,13 +425,7 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Removal 
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
-    slot.slotdata = slotdata;
-    slot.requestTime = uint40(block.timestamp);
-    slot.requester = msg.sender;
-    slot.settingsId = _settingsId;
-    emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+    _removeItem(_workSlot, _settingsId, _idSlot, _idRequestTime, slot);
   }
 
   function removeItemInFirstFreeSlot(
@@ -435,27 +435,32 @@ contract SlotCurate is IArbitrable {
     uint40 _idRequestTime
   ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    removeItem(workSlot, _settingsId, _idSlot, _idRequestTime);
+    Slot storage slot =slots[workSlot];
+    Settings storage settings = settingsMap[_settingsId];
+    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    _removeItem(workSlot, _settingsId, _idSlot, _idRequestTime, slot);
   }
 
-  function editItem(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
+  function editItem(
+    uint64 _workSlot,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    uint40 _idRequestTime
+  ) public payable {
     Slot storage slot = slots[_workSlot];
     (bool used, , ) = slotdataToParams(slot.slotdata);
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Edit
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
-    slot.slotdata = slotdata;
-    slot.requestTime = uint40(block.timestamp);
-    slot.requester = msg.sender;
-    slot.settingsId = _settingsId;
-    emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+    _editItem(_workSlot, _settingsId, _idSlot, _idRequestTime, slot);
   }
 
   function editItemInFirstFreeSlot(uint64 _fromSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    editItem(workSlot, _settingsId, _idSlot, _idRequestTime);
+    Slot storage slot =slots[workSlot];
+    Settings storage settings = settingsMap[_settingsId];
+    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    _editItem(workSlot, _settingsId, _idSlot, _idRequestTime, slot);
   }
 
   function executeRequest(uint64 _slotIndex) public {
@@ -734,7 +739,56 @@ contract SlotCurate is IArbitrable {
 
   // PRIVATE FUNCTIONS
 
-  // reverts if not under appealDeadline
+
+  function _addItem(
+    uint64 _listIndex,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    string memory _ipfsUri,
+    Slot storage _slot
+  ) private {
+    // used: true, disputed: false, processType: Add 
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
+    _slot.slotdata = slotdata;
+    _slot.requestTime = uint40(block.timestamp);
+    _slot.requester = msg.sender;
+    _slot.settingsId = _settingsId;
+    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
+  }
+
+  function _removeItem(
+    uint64 _workSlot,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    uint40 _idRequestTime,
+    Slot storage _slot
+  ) private {
+    // used: true, disputed: false, processType: Removal 
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
+    _slot.slotdata = slotdata;
+    _slot.requestTime = uint40(block.timestamp);
+    _slot.requester = msg.sender;
+    _slot.settingsId = _settingsId;
+    emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+  }
+
+  function _editItem(
+    uint64 _workSlot,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    uint40 _idRequestTime,
+    Slot storage _slot
+  ) private {
+    // used: true, disputed: false, processType: Edit
+    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
+    _slot.slotdata = slotdata;
+    _slot.requestTime = uint40(block.timestamp);
+    _slot.requester = msg.sender;
+    _slot.settingsId = _settingsId;
+    emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+  }
+
+  // can mutate storage. reverts if not under appealDeadline
   function _verifyUnderAppealDeadline(Dispute storage _dispute, IArbitrator _arbitrator) private {
     if (block.timestamp >= _dispute.appealDeadline) {
       // you're over it. get updated appealPeriod
