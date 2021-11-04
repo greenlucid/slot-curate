@@ -10,6 +10,7 @@
 pragma solidity ^0.8.4;
 import "@kleros/erc-792/contracts/IArbitrable.sol";
 import "@kleros/erc-792/contracts/IArbitrator.sol";
+import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 
 /*
     things to think about
@@ -197,7 +198,8 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
     
 */
 
-contract SlotCurate is IArbitrable {
+contract SlotCurate is IArbitrable, IEvidence {
+  uint8 constant NUMBER_OF_RULING_OPTIONS = 2;
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
   uint256 internal constant RULING_OPTIONS = 2;
   uint256 internal constant DIVIDER = 1000000;
@@ -290,7 +292,7 @@ contract SlotCurate is IArbitrable {
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
-  event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, address _arbitrator);
+  event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, IArbitrator _arbitrator);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
@@ -311,7 +313,7 @@ contract SlotCurate is IArbitrable {
   uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
 
   mapping(uint64 => Slot) internal slots;
-  mapping(uint64 => Dispute) internal disputes;
+  mapping(uint64 => DisputeStruct) internal disputes;
   mapping(uint64 => List) internal lists;
   // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
   mapping(uint48 => Settings) internal settingsMap;
@@ -361,7 +363,11 @@ contract SlotCurate is IArbitrable {
     uint80 _challengerStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
-    address _arbitrator
+    IArbitrator _arbitrator,
+    bytes calldata _arbitratorExtraData,
+    string memory _addMetaEvidence,
+    string memory _removeMetaEvidence,
+    string memory _updateMetaEvidence
   ) public {
     // require is not used. there can be up to 281T.
     // that's 1M years of full 15M gas blocks every 13s.
@@ -373,7 +379,12 @@ contract SlotCurate is IArbitrable {
     settings.challengerStake = _challengerStake;
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
-    settings.arbitrator = IArbitrator(_arbitrator);
+    settings.arbitrator = _arbitrator;
+    settings.arbitratorExtraData = _arbitratorExtraData;
+
+    emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
+    emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
+    emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
     emit SettingsCreated(_requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator);
   }
 
@@ -386,14 +397,14 @@ contract SlotCurate is IArbitrable {
     uint64 _listIndex,
     uint48 _settingsId,
     uint64 _idSlot,
-    string memory _ipfsUri
+    string calldata _ipfsUri
   ) public payable {
     Slot storage slot = slots[_idSlot];
     (bool used, , ) = slotdataToParams(slot.slotdata);
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Add 
+    // used: true, disputed: false, processType: Add
     uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
     slot.slotdata = slotdata;
     slot.requestTime = uint40(block.timestamp);
@@ -428,7 +439,7 @@ contract SlotCurate is IArbitrable {
     require(used == false, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
-    // used: true, disputed: false, processType: Removal 
+    // used: true, disputed: false, processType: Removal
     uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
     slot.slotdata = slotdata;
     slot.requestTime = uint40(block.timestamp);
@@ -446,7 +457,7 @@ contract SlotCurate is IArbitrable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
     removeItem(workSlot, _settingsId, _idSlot, _idRequestTime);
   }
-
+  
   function editItem(
     uint64 _workSlot,
     uint48 _settingsId,
@@ -585,7 +596,7 @@ contract SlotCurate is IArbitrable {
 
   function executeRuling(uint64 _disputeSlot) public {
     //1. get arbitrator for that setting, and disputeId from disputeSlot.
-    Dispute storage dispute = disputes[_disputeSlot];
+    DisputeStruct storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
     Settings storage settings = settingsMap[slot.settingsId];
     // 2. make sure that disputeSlot has an ongoing dispute
@@ -814,6 +825,14 @@ contract SlotCurate is IArbitrable {
     uint refund = decompressAmount(_contribution.amount);
     payable(_contribution.contributor).transfer(refund);
   }
+  
+  function submitEvidence(uint64 _disputeSlot, string calldata _evidenceURI) external {
+    DisputeStruct storage dispute = disputes[_disputeSlot];
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+
+    emit Evidence(IArbitrator(settings.arbitrator), dispute.arbitratorDisputeId, msg.sender, _evidenceURI);
+  }
 
   // VIEW FUNCTIONS
 
@@ -884,7 +903,7 @@ contract SlotCurate is IArbitrable {
 
     uint8 processTypeAddend = _slotdata & 48;
     ProcessType processType = ProcessType(processTypeAddend >> 4);
-    
+
     return (used, disputed, processType);
   }
 
