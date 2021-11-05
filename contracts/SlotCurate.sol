@@ -398,8 +398,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     string calldata _ipfsUri
   ) public payable {
     Slot storage slot = slots[_idSlot];
-    (bool used, , ) = slotdataToParams(slot.slotdata);
-    require(used == false, "Slot must not be in use");
+    // If free, it is of form 0xxx0000, so it's smaller than 128
+    require(slot.slotdata < 128, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
     // used: true, disputed: false, processType: Add
@@ -433,8 +433,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint40 _idRequestTime
   ) public payable {
     Slot storage slot = slots[_workSlot];
-    (bool used, , ) = slotdataToParams(slot.slotdata);
-    require(used == false, "Slot must not be in use");
+    // If free, it is of form 0xxx0000, so it's smaller than 128
+    require(slot.slotdata < 128, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
     // used: true, disputed: false, processType: Removal
@@ -463,8 +463,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint40 _idRequestTime
   ) public payable {
     Slot storage slot = slots[_workSlot];
-    (bool used, , ) = slotdataToParams(slot.slotdata);
-    require(used == false, "Slot must not be in use");
+    // If free, it is of form 0xxx0000, so it's smaller than 128
+    require(slot.slotdata < 128, "Slot must not be in use");
     Settings storage settings = settingsMap[_settingsId];
     require(msg.value >= settings.requesterStake, "Not enough to cover stake");
     // used: true, disputed: false, processType: Edit
