@@ -331,7 +331,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   function createList(
     address _governor,
     uint48 _settingsId,
-    string memory _ipfsUri
+    string calldata _ipfsUri
   ) public {
     require(_settingsId < settingsCount, "Settings must exist");
     // requiring that listCount != type(uint64).max is not needed. makes it ~1k more expensive
