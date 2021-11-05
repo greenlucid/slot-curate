@@ -288,7 +288,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   // EVENTS //
 
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
-  event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
+  event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
   event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, IArbitrator _arbitrator);
   // why emit settingsId in the request events?
@@ -345,13 +345,14 @@ contract SlotCurate is IArbitrable, IEvidence {
   function updateList(
     uint64 _listIndex,
     uint48 _settingsId,
-    address _newGovernor
+    address _newGovernor,
+    string calldata _ipfsUri
   ) public {
     List storage list = lists[_listIndex];
     require(msg.sender == list.governor, "You need to be the governor");
     list.governor = _newGovernor;
     list.settingsId = _settingsId;
-    emit ListUpdated(_listIndex, _settingsId, _newGovernor);
+    emit ListUpdated(_listIndex, _settingsId, _newGovernor, _ipfsUri);
   }
 
   // settings
