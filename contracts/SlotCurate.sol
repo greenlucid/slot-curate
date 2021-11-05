@@ -536,6 +536,16 @@ contract SlotCurate is IArbitrable, IEvidence {
     dispute.appealDeadline = 0;
     dispute.roundZeroCost = compressAmount(arbitrationCost);
     dispute.freeSpace2 = 1; // to make sure slot never goes to zero.
+
+    // initialize roundContributions of round: 1
+    // reconsider changing this. because right now you're making challenger pay for it!
+    // but, who else will pay for it?
+    // will be 5k in reused. but 20k in new.
+    RoundContributions storage roundContributions = roundContributionsMap[_disputeSlot][1];
+    roundContributions.filler = 1;
+    roundContributions.appealCost = 0;
+    roundContributions.partyTotal[0] = 0;
+    roundContributions.partyTotal[1] = 0;
   }
 
   function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot) public payable {
