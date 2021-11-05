@@ -514,8 +514,11 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     uint256 arbitrationCost = settings.arbitrator.arbitrationCost(settings.arbitratorExtraData);
 
-    uint totalInitialStake = decompressAmount(settings.requesterStake + settings.challengerStake) * settings.multiplier / DIVIDER;
-    require(compressAmount(arbitrationCost) <= totalInitialStake, "Not enough for stake");
+    // this is for the edge case in which arbitrator changes cost
+    // and stake doesn't cover it anymore.
+    uint totalInitialStake = decompressAmount(settings.requesterStake + settings.challengerStake);
+    uint minimumNeeded = arbitrationCost * settings.multiplier / DIVIDER;
+    require(totalInitialStake >= minimumNeeded, "Stake is not enough to challenge");
 
     uint arbitratorDisputeId = settings.arbitrator.createDispute
       { value: arbitrationCost }
