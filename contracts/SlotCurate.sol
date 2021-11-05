@@ -585,6 +585,18 @@ contract SlotCurate is IArbitrable, IEvidence {
       {value: appealCost}
       (dispute.arbitratorDisputeId, settings.arbitratorExtraData);
 
+    // remember the appeal cost, for sharing the spoils later
+    roundContributionsMap[_disputeSlot][nextRound].appealCost = compressAmount(appealCost);
+
+    dispute.currentRound++;
+
+    // set the roundContributions of the upcoming round to zero.
+    RoundContributions storage roundContributions = roundContributionsMap[_disputeSlot][nextRound + 1];
+    roundContributions.appealCost = 0;
+    roundContributions.partyTotal[0] = 0;
+    roundContributions.partyTotal[1] = 0;
+    roundContributions.filler = 1; // to avoid getting whole storage slot to 0.
+
     // you may to emit an event for this. but there's no need
     // arbitrator will surely do it for you
   }
