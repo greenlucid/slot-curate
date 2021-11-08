@@ -201,7 +201,7 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 contract SlotCurate is IArbitrable, IEvidence {
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
   uint256 internal constant RULING_OPTIONS = 2;
-  uint256 internal constant DIVIDER = 1000000;
+  uint256 internal constant DIVIDER = 1_000_000;
 
   enum ProcessType {
     Add,
@@ -222,10 +222,9 @@ contract SlotCurate is IArbitrable, IEvidence {
   // settings cannot be mutated once created, otherwise pending processes could get attacked.
   struct Settings {
     uint80 requesterStake;
-    uint80 challengerStake;
     uint40 requestPeriod;
     uint40 fundingPeriod;
-    uint16 freeSpace2;
+    uint96 freeSpace2;
     IArbitrator arbitrator;
     uint64 multiplier; // divide by DIVIDER for float.
     uint32 freeSpace;
@@ -258,8 +257,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 nContributions;
     uint64 pendingWithdraws; 
     uint40 appealDeadline; // to derive
-    uint80 roundZeroCost; // to distribute requester / challenger reward. sure you need this?
-    uint8 freeSpace2;
+    uint88 freeSpace2;
   }
 
   struct Contribution {
@@ -370,7 +368,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   // bit of a draft since I havent done the dispute side of things yet
   function createSettings(
     uint80 _requesterStake,
-    uint80 _challengerStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
     IArbitrator _arbitrator,
@@ -386,7 +383,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     // require(settingsCount != type(uint48).max, "Max settings reached");
     Settings storage settings = settingsMap[settingsCount++];
     settings.requesterStake = _requesterStake;
-    settings.challengerStake = _challengerStake;
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
     settings.arbitrator = _arbitrator;
@@ -395,7 +391,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
-    emit SettingsCreated(_requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator);
+    emit SettingsCreated(_requesterStake, _requestPeriod, _fundingPeriod, _arbitrator);
   }
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
@@ -517,7 +513,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_slotIndex];
     Settings storage settings = settingsMap[slot.settingsId];
     require(slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
-    require(msg.value >= settings.challengerStake, "Not enough to cover stake");
     
     DisputeSlot storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Free, "That dispute slot is being used");
@@ -527,18 +522,12 @@ contract SlotCurate is IArbitrable, IEvidence {
       require(arbitratorsWhitelist[address(settings.arbitrator)], "Cannot reuse, not in whitelist");
     }
 
-    // it will be challenged now
-
-    uint256 arbitrationCost = settings.arbitrator.arbitrationCost(settings.arbitratorExtraData);
-
-    // this is for the edge case in which arbitrator changes cost
-    // and stake doesn't cover it anymore.
-    uint totalInitialStake = decompressAmount(settings.requesterStake + settings.challengerStake);
-    uint minimumNeeded = arbitrationCost * settings.multiplier / DIVIDER;
-    require(totalInitialStake >= minimumNeeded, "Stake is not enough to challenge");
+    // dont require enough to cover arbitration fees
+    // arbitrator will already take care of it
+    // challenger pays arbitration fees + gas costs fully
 
     uint arbitratorDisputeId = settings.arbitrator.createDispute
-      { value: arbitrationCost }
+      { value: msg.value }
       (RULING_OPTIONS,settings.arbitratorExtraData);
 
     (, , ProcessType processType) = slotdataToParams(slot.slotdata);
@@ -554,7 +543,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     dispute.nContributions = 0;
     dispute.pendingWithdraws = 0;
     dispute.appealDeadline = 0;
-    dispute.roundZeroCost = compressAmount(arbitrationCost);
     dispute.freeSpace2 = 1; // to make sure slot never goes to zero.
 
     // initialize roundContributions of round: 1
@@ -828,15 +816,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     Party _party
   ) private {
     // this method is already told who won.
-    uint spoils = decompressAmount(
-      _settings.requesterStake
-      + _settings.challengerStake
-      - _dispute.roundZeroCost
-    );
+    uint amount = decompressAmount(_settings.requesterStake);
     if (_party == Party.Requester) {
-      payable(_slot.requester).transfer(spoils);
+      payable(_slot.requester).transfer(amount);
     } else if (_party == Party.Challenger) {
-      payable(_dispute.challenger).transfer(spoils);
+      payable(_dispute.challenger).transfer(amount);
     }
   }
 
