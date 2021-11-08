@@ -640,6 +640,7 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   function rule(uint256 _disputeId, uint256 _ruling) external override {
     // no need to check if already ruled, arbitrator is trusted.
+    require(msg.sender == address(arbitrator), "Only arbitrator can rule");
     storedRulings[_disputeId] = StoredRuling({ruling: uint240(_ruling), ruled: true, executed: false});
     emit Ruling(arbitrator, _disputeId, _ruling);
   }
