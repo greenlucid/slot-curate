@@ -288,7 +288,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
-  event SettingsCreated(uint256 _requesterStake, uint256 _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod, IArbitrator _arbitrator);
+  event SettingsCreated(uint256 _requesterStake, uint40 _requestPeriod, uint40 _fundingPeriod, IArbitrator _arbitrator);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
