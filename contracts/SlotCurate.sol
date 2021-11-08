@@ -223,9 +223,8 @@ contract SlotCurate is IArbitrable, IEvidence {
   struct Settings {
     uint80 requesterStake;
     uint40 requestPeriod;
-    uint40 fundingPeriod;
     uint64 multiplier; // divide by DIVIDER for float.
-    uint32 freeSpace;
+    uint72 freeSpace;
     bytes arbitratorExtraData; // since you're deploying with a known arbitrator
     // you can hardcode the size of the arbitratorExtraData and save 1 storage slot
     // like, bytes32[2] arbitratorExtraData
@@ -293,8 +292,8 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
-  // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
-  event SettingsCreated(uint256 _requesterStake, uint40 _requestPeriod, uint40 _fundingPeriod);
+  // _requesterStake, _requestPeriod,
+  event SettingsCreated(uint256 _requesterStake, uint40 _requestPeriod);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
@@ -376,7 +375,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   function createSettings(
     uint80 _requesterStake,
     uint40 _requestPeriod,
-    uint40 _fundingPeriod,
     bytes calldata _arbitratorExtraData,
     string memory _addMetaEvidence,
     string memory _removeMetaEvidence,
@@ -390,13 +388,12 @@ contract SlotCurate is IArbitrable, IEvidence {
     Settings storage settings = settingsMap[settingsCount++];
     settings.requesterStake = _requesterStake;
     settings.requestPeriod = _requestPeriod;
-    settings.fundingPeriod = _fundingPeriod;
     settings.arbitratorExtraData = _arbitratorExtraData;
 
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
-    emit SettingsCreated(_requesterStake, _requestPeriod, _fundingPeriod);
+    emit SettingsCreated(_requesterStake, _requestPeriod);
   }
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
