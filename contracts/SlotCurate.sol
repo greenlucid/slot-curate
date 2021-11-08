@@ -225,9 +225,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint40 requestPeriod;
     uint40 fundingPeriod;
     uint96 freeSpace2;
-    IArbitrator arbitrator;
     uint64 multiplier; // divide by DIVIDER for float.
-    uint32 freeSpace;
+    uint192 freeSpace;
     bytes arbitratorExtraData;
   }
 
@@ -288,7 +287,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
   // _requesterStake, _challengerStake, _requestPeriod, _fundingPeriod, _arbitrator
-  event SettingsCreated(uint256 _requesterStake, uint40 _requestPeriod, uint40 _fundingPeriod, IArbitrator _arbitrator);
+  event SettingsCreated(uint256 _requesterStake, uint40 _requestPeriod, uint40 _fundingPeriod);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
@@ -316,6 +315,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   // CONTRACT STORAGE //
 
   address internal governor; // governor can whitelist arbitrators.
+  IArbitrator immutable internal arbitrator;
   uint64 internal listCount;
   uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
 
@@ -327,11 +327,11 @@ contract SlotCurate is IArbitrable, IEvidence {
   mapping(uint64 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
   // totalContributions[disputeSlot][round][Party]
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
-  mapping(address => mapping(uint256 => StoredRuling)) internal storedRulings; // storedRulings[arbitrator][disputeId]
-  mapping(address => bool) internal arbitratorsWhitelist; // to restrict reusing disputeSlots. you don't need to be in for creating new.
+  mapping(uint256 => StoredRuling) internal storedRulings; // storedRulings[disputeId]
 
-  constructor(address _governor) {
+  constructor(address _governor, address _arbitrator) {
     governor = _governor;
+    arbitrator = IArbitrator(_arbitrator);
   }
 
   // PUBLIC FUNCTIONS
@@ -370,7 +370,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint80 _requesterStake,
     uint40 _requestPeriod,
     uint40 _fundingPeriod,
-    IArbitrator _arbitrator,
     bytes calldata _arbitratorExtraData,
     string memory _addMetaEvidence,
     string memory _removeMetaEvidence,
@@ -385,13 +384,12 @@ contract SlotCurate is IArbitrable, IEvidence {
     settings.requesterStake = _requesterStake;
     settings.requestPeriod = _requestPeriod;
     settings.fundingPeriod = _fundingPeriod;
-    settings.arbitrator = _arbitrator;
     settings.arbitratorExtraData = _arbitratorExtraData;
 
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
-    emit SettingsCreated(_requesterStake, _requestPeriod, _fundingPeriod, _arbitrator);
+    emit SettingsCreated(_requesterStake, _requestPeriod, _fundingPeriod);
   }
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
@@ -517,16 +515,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     DisputeSlot storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Free, "That dispute slot is being used");
 
-    if (dispute.challenger != address(0)) {
-      // non-virgin dispute slot.
-      require(arbitratorsWhitelist[address(settings.arbitrator)], "Cannot reuse, not in whitelist");
-    }
-
     // dont require enough to cover arbitration fees
     // arbitrator will already take care of it
     // challenger pays arbitration fees + gas costs fully
 
-    uint arbitratorDisputeId = settings.arbitrator.createDispute
+    uint arbitratorDisputeId = arbitrator.createDispute
       { value: msg.value }
       (RULING_OPTIONS,settings.arbitratorExtraData);
 
@@ -546,8 +539,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     dispute.freeSpace2 = 1; // to make sure slot never goes to zero.
 
     // initialize roundContributions of round: 1
-    // reconsider changing this. because right now you're making challenger pay for it!
-    // but, who else will pay for it?
     // will be 5k in reused. but 20k in new.
     RoundContributions storage roundContributions = roundContributionsMap[_disputeSlot][1];
     roundContributions.filler = 1;
@@ -563,11 +554,9 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
     DisputeSlot storage dispute = disputes[_disputeSlot];
-    Slot storage slot = slots[dispute.slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
     require(dispute.state == DisputeState.Used, "DisputeSlot has to be used");
 
-    _verifyUnderAppealDeadline(dispute, settings.arbitrator);
+    _verifyUnderAppealDeadline(dispute);
 
     uint8 nextRound = dispute.currentRound + 1;
     uint8 contribdata = paramsToContribdata(true, _party);
@@ -586,9 +575,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     Settings storage settings = settingsMap[slot.settingsId];
     require(dispute.state == DisputeState.Used, "DisputeSlot has to be Used");
     
-    _verifyUnderAppealDeadline(dispute, settings.arbitrator);
+    _verifyUnderAppealDeadline(dispute);
     
-    uint appealCost = settings.arbitrator.appealCost(dispute.arbitratorDisputeId, settings.arbitratorExtraData);
+    uint appealCost = arbitrator.appealCost(dispute.arbitratorDisputeId, settings.arbitratorExtraData);
     uint totalAmountNeeded = appealCost * settings.multiplier / DIVIDER;
 
     // make sure you have the required amount
@@ -599,7 +588,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(currentAmount >= totalAmountNeeded, "Not enough to fund round");
     
     // got enough, it's legit to do so. I can appeal, lets appeal
-    settings.arbitrator.appeal
+    arbitrator.appeal
       {value: appealCost}
       (dispute.arbitratorDisputeId, settings.arbitratorExtraData);
 
@@ -620,14 +609,13 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   function executeRuling(uint64 _disputeSlot) public {
-    //1. get arbitrator for that setting, and disputeId from disputeSlot.
+    //1. get disputeId from disputeSlot.
     DisputeSlot storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
     // 2. make sure that disputeSlot has an ongoing dispute
     require(dispute.state == DisputeState.Used, "Can only be executed if Used");
-    // 3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
-    StoredRuling storage storedRuling = storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+    // 3. access storedRulings[disputeId]. make sure it's ruled.
+    StoredRuling storage storedRuling = storedRulings[dispute.arbitratorDisputeId];
     require(storedRuling.ruled, "Wasn't ruled by the arbitrator");
     require(!storedRuling.executed, "Has already been executed");
     // 4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
@@ -647,24 +635,21 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   function rule(uint256 _disputeId, uint256 _ruling) external override {
-    // no need to check if already ruled, every arbitrator is trusted.
-    // arbitrators that "cheat" don't matter, no one will use them.
-    storedRulings[msg.sender][_disputeId] = StoredRuling({ruling: uint240(_ruling), ruled: true, executed: false});
-    emit Ruling(IArbitrator(msg.sender), _disputeId, _ruling);
+    // no need to check if already ruled, arbitrator is trusted.
+    storedRulings[_disputeId] = StoredRuling({ruling: uint240(_ruling), ruled: true, executed: false});
+    emit Ruling(arbitrator, _disputeId, _ruling);
   }
 
   function withdrawOneContribution(uint64 _disputeSlot, uint64 _contributionSlot) public {
     // check if dispute is used.
     DisputeSlot storage dispute = disputes[_disputeSlot];
-    Slot storage slot = slots[dispute.slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
     // withdrawAllRewards does not set the flag on "withdrawn" individually.
     // that's why you check for dispute as well.
     require(dispute.state == DisputeState.Used, "DisputeSlot must be in use");
     require(dispute.nContributions > _contributionSlot, "DisputeSlot lacks that contrib");
     // to check if dispute is really over. 
     StoredRuling storage storedRuling = 
-      storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+      storedRulings[dispute.arbitratorDisputeId];
     require(storedRuling.ruled && storedRuling.executed, "Must be ruled and executed");
 
     Contribution storage contribution = contributions[_disputeSlot][_contributionSlot];
@@ -700,7 +685,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   function withdrawRoundZero(uint64 _disputeSlot) public {
-    // "round zero" refers to the initial requester, challenger stake.
+    // "round zero" refers to the initial requester stake
     // it's not stored like the other contributions.
     DisputeSlot storage dispute = disputes[_disputeSlot];
     Slot storage slot = slots[dispute.slotId];
@@ -709,7 +694,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(dispute.state == DisputeState.Used, "DisputeSlot must be in use");
     // to check if dispute is really over. 
     StoredRuling storage storedRuling = 
-      storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+      storedRulings[dispute.arbitratorDisputeId];
     require(storedRuling.ruled && storedRuling.executed, "Must be ruled and executed");
     require(dispute.pendingInitialWithdraw, "Round zero was already withdrawn");
 
@@ -740,7 +725,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     // that's why you check for dispute as well.
     require(dispute.state == DisputeState.Used, "DisputeSlot must be in use");
     StoredRuling storage storedRuling = 
-      storedRulings[address(settings.arbitrator)][dispute.arbitratorDisputeId];
+      storedRulings[dispute.arbitratorDisputeId];
     require(storedRuling.ruled && storedRuling.executed, "Must be ruled and executed");
     Party winningParty = whichPartyWon(storedRuling.ruling);
     uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
@@ -785,12 +770,6 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // governor functions
 
-  function changeWhitelist(address _arbitrator, bool _status) public {
-    require(msg.sender == governor, "Only governor changes this");
-    arbitratorsWhitelist[_arbitrator] = _status;
-    emit WhitelistChange(_arbitrator, _status);
-  }
-
   function changeGovernor(address _governor) public {
     require(msg.sender == governor, "Only governor changes this");
     governor = _governor;
@@ -800,10 +779,10 @@ contract SlotCurate is IArbitrable, IEvidence {
   // PRIVATE FUNCTIONS
 
   // can mutate storage. reverts if not under appealDeadline
-  function _verifyUnderAppealDeadline(DisputeSlot storage _dispute, IArbitrator _arbitrator) private {
+  function _verifyUnderAppealDeadline(DisputeSlot storage _dispute) private {
     if (block.timestamp >= _dispute.appealDeadline) {
       // you're over it. get updated appealPeriod
-      (, uint end) = _arbitrator.appealPeriod(_dispute.arbitratorDisputeId);
+      (, uint end) = arbitrator.appealPeriod(_dispute.arbitratorDisputeId);
       require(block.timestamp < end, "Over submision period");
       _dispute.appealDeadline = uint40(end);
     }
@@ -849,10 +828,8 @@ contract SlotCurate is IArbitrable, IEvidence {
   
   function submitEvidence(uint64 _disputeSlot, string calldata _evidenceURI) external {
     DisputeSlot storage dispute = disputes[_disputeSlot];
-    Slot storage slot = slots[dispute.slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
 
-    emit Evidence(IArbitrator(settings.arbitrator), dispute.arbitratorDisputeId, msg.sender, _evidenceURI);
+    emit Evidence(arbitrator, dispute.arbitratorDisputeId, msg.sender, _evidenceURI);
   }
 
   // VIEW FUNCTIONS
