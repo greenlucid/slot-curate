@@ -307,8 +307,8 @@ contract SlotCurate is IArbitrable, IEvidence {
   // because of how topics work
   // compress all small params into one bytes32. deal with it in subgraph.
   event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _idSlot, string _ipfsUri);
-  event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
-  event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime, string _ipfsUri);
+  event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId);
+  event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
   event RequestAccepted(uint64 _slotIndex);
   event RequestRejected(uint64 _slotIndex);
@@ -444,8 +444,8 @@ contract SlotCurate is IArbitrable, IEvidence {
   function removeItem(
     uint64 _workSlot,
     uint48 _settingsId,
-    uint64 _idSlot,
-    uint40 _idRequestTime
+    uint64 _listId,
+    uint64 _itemId
   ) public payable {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
@@ -458,24 +458,24 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
+    emit ItemRemovalRequest(_workSlot, _settingsId, _listId, _itemId);
   }
 
   function removeItemInFirstFreeSlot(
     uint64 _fromSlot,
     uint48 _settingsId,
-    uint64 _idSlot,
-    uint40 _idRequestTime
+    uint64 _listId,
+    uint64 _itemId
   ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    removeItem(workSlot, _settingsId, _idSlot, _idRequestTime);
+    removeItem(workSlot, _settingsId, _listId, _itemId);
   }
   
   function editItem(
     uint64 _workSlot,
     uint48 _settingsId,
-    uint64 _idSlot,
-    uint40 _idRequestTime,
+    uint64 _listId,
+    uint64 _itemId,
     string calldata _ipfsUri
   ) public payable {
     Slot storage slot = slots[_workSlot];
@@ -489,18 +489,18 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemEditRequest(_workSlot, _settingsId, _idSlot, _idRequestTime, _ipfsUri);
+    emit ItemEditRequest(_workSlot, _settingsId, _listId, _itemId, _ipfsUri);
   }
 
   function editItemInFirstFreeSlot(
     uint64 _fromSlot,
     uint48 _settingsId,
-    uint64 _idSlot,
-    uint40 _idRequestTime,
+    uint64 _listId,
+    uint64 _itemId,
     string calldata _ipfsUri
   ) public payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    editItem(workSlot, _settingsId, _idSlot, _idRequestTime, _ipfsUri);
+    editItem(workSlot, _settingsId, _listId, _itemId, _ipfsUri);
   }
 
   function executeRequest(uint64 _slotIndex) public {
