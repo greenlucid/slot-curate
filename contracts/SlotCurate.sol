@@ -215,7 +215,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   enum DisputeState {
-    Free, // you can take slot
+    Free,
     Used
   }
 
@@ -224,10 +224,17 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint80 requesterStake;
     uint40 requestPeriod;
     uint40 fundingPeriod;
-    uint96 freeSpace2;
     uint64 multiplier; // divide by DIVIDER for float.
-    uint192 freeSpace;
-    bytes arbitratorExtraData;
+    uint32 freeSpace;
+    bytes arbitratorExtraData; // since you're deploying with a known arbitrator
+    // you can hardcode the size of the arbitratorExtraData and save 1 storage slot
+    // like, bytes32[2] arbitratorExtraData
+    // just transform it when needed.
+    // should be cheaper to interact with since you don't have to storage read the length
+    // (because "bytes" stores length too)
+    // even, if arb doesn't need a lot of data
+    // you can just store it in the free space.
+    // e.g. KlerosLiquid uses like 32 bits of data max.
   }
 
   struct List {
