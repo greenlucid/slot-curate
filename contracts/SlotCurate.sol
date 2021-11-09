@@ -291,8 +291,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(slot.slotdata < 128, "Slot must not be in use");
     require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Removal
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
-    slot.slotdata = slotdata;
+    // paramsToSlotdata(true, false, ProcessType.Removal) = 128 + 16 = 144
+    slot.slotdata = 144;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
@@ -321,8 +321,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(slot.slotdata < 128, "Slot must not be in use");
     require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Edit
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
-    slot.slotdata = slotdata;
+    // paramsToSlotdata(true, false, ProcessType.Edit) = 160
+    slot.slotdata = 160;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
