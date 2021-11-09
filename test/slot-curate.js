@@ -97,14 +97,6 @@ describe("SlotCurate", () => {
 
       await slotCurate.connect(requester).challengeRequest(...args, { value: CHALLENGE_FEE });
     });
-
-    it("Should let others to contribute appeal fees of an item.", async () => {
-      const args = [0, 0];
-
-      const CHALLENGE_FEE = await slotCurate.connect(innocentBystander).challengeFee(args[0]);
-
-      await slotCurate.connect(requester).challengeRequest(...args, { value: CHALLENGE_FEE });
-    });
   });
 });
 
@@ -114,7 +106,7 @@ async function deployContracts(deployer) {
   await arbitrator.deployed();
 
   const SlotCurate = await ethers.getContractFactory("SlotCurate", deployer);
-  const slotCurate = await SlotCurate.deploy(governor.address, arbitrator.address);
+  const slotCurate = await SlotCurate.deploy(arbitrator.address);
   await slotCurate.deployed();
 
   return {
