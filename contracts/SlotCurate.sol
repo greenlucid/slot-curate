@@ -251,8 +251,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_idSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    // TODO the requesterStake is uint80 (compressed) but compared against uint256 msg.value
-    require(msg.value >= settingsMap[_settingsId].requesterStake, "Not enough to cover stake");
+    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Add
     // paramsToSlotdata(true, false, ProcessType.Add) = 128
     // TODO same improvement for all other requests
@@ -290,8 +289,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Removal
     uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Removal);
     slot.slotdata = slotdata;
@@ -321,8 +319,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Edit
     uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Edit);
     slot.slotdata = slotdata;
