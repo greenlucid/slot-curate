@@ -313,6 +313,13 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId);
   event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
+
+  // how to tell if DisputeSlot is now used? You need to emit an event here
+  // because the Challenge event in Arbitrator only knows about external disputeId
+  // these events allow the subgraph to know the status of DisputeSlots
+  event RequestChallenged(uint64 _slotIndex, uint64 _disputeSlot);
+  event FreedDisputeSlot(uint64 _disputeSlot);
+
   event RequestAccepted(uint64 _slotIndex);
   event RequestRejected(uint64 _slotIndex);
   event WhitelistChange(address _arbitrator, bool _status);
@@ -549,6 +556,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     roundContributions.appealCost = 0;
     roundContributions.partyTotal[0] = 0;
     roundContributions.partyTotal[1] = 0;
+
+    emit RequestChallenged(_slotIndex, _disputeSlot);
   }
 
   function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot) public payable {
@@ -684,6 +693,7 @@ contract SlotCurate is IArbitrable, IEvidence {
       // this was last contrib remaining
       // no need to decrement pendingWithdraws if last. save gas.
       dispute.state = DisputeState.Free;
+      emit FreedDisputeSlot(_disputeSlot);
     } else {
       dispute.pendingWithdraws--;
     }
@@ -710,6 +720,7 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     if (dispute.pendingWithdraws == 0) {
       dispute.state = DisputeState.Free;
+      emit FreedDisputeSlot(_disputeSlot);
     } else {
       dispute.pendingInitialWithdraw = false;
     }
