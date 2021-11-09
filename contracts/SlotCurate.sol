@@ -322,7 +322,6 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   event RequestAccepted(uint64 _slotIndex);
   event RequestRejected(uint64 _slotIndex);
-  event WhitelistChange(address _arbitrator, bool _status);
   event GovernorChange(address _governor);
 
   // CONTRACT STORAGE //
