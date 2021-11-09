@@ -90,13 +90,13 @@ describe("SlotCurate", () => {
       await slotCurate.connect(requester).editItemInFirstFreeSlot(...args, { value: REQUESTER_STAKE });
     });
 
-    it("Should challenge an item.", async () => {
+    /*it("Should challenge an item.", async () => {
       const args = [0, 0];
 
       const CHALLENGE_FEE = await slotCurate.connect(innocentBystander).challengeFee(args[0]);
 
       await slotCurate.connect(requester).challengeRequest(...args, { value: CHALLENGE_FEE });
-    });
+    });*/
   });
 });
 

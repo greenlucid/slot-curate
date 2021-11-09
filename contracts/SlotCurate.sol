@@ -19,189 +19,24 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     and write "bugs" that really are deliberate decisions to optimize gas
     and the workarounds there are around them.
 
-    put an option to manually call the function to calculate juror fees and store it locally
-    instead of calling an expensive function over contracts every time
-    this would get harder if we store arbitrator / arbextradata separately
-
     put the most used functions (add, remove item) as first functions because that
     makes it cheaper
-
-    ideas for the future:
-    not even store all data to verify the process on chain. you could let invalid process on chain
-    just exist and finish, and ignore them.
-    you could even not store the lists logic at all, make them just be another item submission, somehow.
-    again, the terms will be stored off chain, so whoever doesn't play by the rules is just ignored
-    and you let their process exist and do whatever.
 
     consider should we have remover / challenger submit "reason", somehow? as another ipfs.
     that'd make those events ~2k more expensive
     but should make the challenging / removing process more healthy.
     if the removal / challenging reason is proved wrong, then even if the item somehow
     doesn't belong there, it is allowed.
-    that reduces the scope of arguments, evidence, etc.
-
-    whats the point of forcing listCount to uint64?
-    there's no saving. maybe in rollups, someday?
-
-    if needed, you can store eth amounts as uint64.
-    rationale: uint88 is enough to index all current wei
-    put an extra byte to be in the safe side. uint96.
-    discard the 4 gwei residue. it's uint64 now.
-
-    ok, i have to save the total amount contributed per side per round.
-    disputeId -> uint8 -> uint80[2]
-    totalContribution[disputeId][round][party]
-    but also cannot afford to have the storage slot reset to 0 every time.
-
-    having it as a mapping is more expensive than an array, isn't it?
-    because you have to put the keys onto storage as well. not sure! check.
-    because all structs are crafted to fit in exact number of slots. so if you can skip
-    storing keys, go for it.
-    somehow I doubt it's possible
-    I'm defo not storing TWO storage slots because then it'd be >60k.
-
-
-    remember to set the successor totalParties to zero on challenge, and on startNextRound
-
-    put more stuff into "totalContributions". rename it to "roundContributions" or something.
-    since I'm doing this anyway, let's just store the number of contributions in the round.
-    why? because of the following edge case.
-    say contribs are like this:
-    11112222222223333333333333
-    ok. and in the threes, there's enough
-    lets say there's enough with the starting 4 threeses...
-    yeah its not really a problem. we've already accepted this. contributions per the round may be
-    overpayed, and what will happen is that they will split the funds proportionally.
-
-    this is not really needed... you could just check if there's already enough to crowdfund for that round. no need for madness.
-    because we can check the total amount needed per party per round, right?
-    problem is we can only know for certain if we call the "calculate cost" function
-    and if we have to do that PER contribution then it will get so expensive.
-    so... lets go back to previous idea. read above.
-
-    fuck it, I don't care about it. lets ignore this and just remember about it
-    and talk about it later to check again if this is a problem.
-    it'd be easy to accomodate a solution if it was troublesome.
-
-    maybe I should check if thing is ruled before allowing rule.
-    and maybe I should have some timestamp thing to make sure arbitrator doesnt cheat
-    but really, whats the point of using an arbitrator if im going to write internal logic?
-    it was about trust. i dont want to overengineer this contract.
-
-
-    the whole "contribute a certain amount for x side" thing is not needed.
-    just check if you contribute the minimum required to advance for next round,
-    (this could be hardcoded, or customizable per setting. calculated as multiplier of appealCost)
-    when the dispute is resolved just split the spoils proportionally to the winning side.
-    edit: I understand it may need a "leap of faith" to believe that the incentives are set up correctly
-    but really, there are similarities with prediction markets
-    say contributor for challenger puts 2/3 of the amount needed
-    why would someone contribute for requester? if no one contributes, then requester wins automatically.
-    so its beneficial for requester and all previous requester contributors
-    but say someone believes in their side. then they just stake more.
-    if one side funded all of a round and lost, then the surplus would just get stuck inside the contract.
-    which you could collect as dev by making a function to cashout a round with this characteristic.
-    to governor or whatever
-
-
-    hey, for withdrawing in a round that wasnt completely funded,
-    dont do it like first version of curate, in which you couldn't get your contribution back.
-    get some way to get the funds out.
-    this means that when withdrawAllContributions finds a contrib for a round
-    that never got disputed
-    then you stop checking for "winner", and just refund all contribs for that round.
-    e.g. send amount.
-
-    what to do when refuse to arbitrate is final? it just defaults to requester, so requester always has an edge.
-    it could default to challenger instead.
-
-    to make sure this is always infallible, store the cost of the appeal the moment it's actually done.
-    store it in RoundContributions
-    so whenever theres a withdrawal for one contribution (assume called the public version)
-    make sure its pending withdrawal
-    make sure its winning side
-    make sure contribution id is below nContributions
-    make sure pendingContributions != 0
-    get spoils by adding the two party amount, substracting appealCost
-    share = spoils * contribution.amount / partyTotal[winningParty]
-    send to contributor.
-    set contribution as withdrawn.
-    decrease pendingWithdrawals
-
-    advance Next Round:
-    check appeal cost
-    multiply it by surplusMultiplier (which is forcibly >1.5 or so. could fit uint8
-    by using low level hacking. say you use 4 bits as fractionary part.
-    alternatively, use uint16, uint24. because say there are very cheap appeal costs,
-    but list owner wants quite a lot of stake in the game. so that they can go higher.
-    uint32 sounds legit for extremely cheap disputes. 4 bits is still enough to store the fractionary part.
-    this multiplier approach will be limiting. its dependant on appeal cost
-    is there a way to make it fixed cost, or fixed increasing cost, somehow?
-    whatever, there's a way around that, just migrate to new settings with new cost.
-
-
-    make a lighter, private version of this that works without the first two conditions,
-    and without setting contribution as withdrawn & without decreasing pendingWithdrawals
-    , to use in withdrawAllContributions.
-    then you can just write: pendingContributions = 0 at the end, that it has been completely withdrawn already.
-
-    you could check if a contribution is withdrawable if contribdata == some number. 128 or 192 depending
-    on winning party.
-    instead of storing it as a variable and reading from it, have an initial branch between parties.
-    and just check contribdata == 128.
-    that should save ~10 gas per iteration (xD)
-
-
-
-    also withdraw the zero round, if pending. (0 withdrawn, 1 pending)
-
-    wait. what about the "zero round"? you could have a 1 bit flag to check for that, in the dispute.
-
-    you can only challenge in a dispute slot if pendingContributions = 0 and zero round has been withdrawn.
-
-    store first round cost in dispute slot, so that you can tell how much to spoil away.
-
-    how does "rule" work. is it at the end of each appeal
-    or is it at the end of all, and it's final?
-    because I've assumed 2nd one. but that's probably not right, is it?
-    how does my contract get the information that the round has finished?
-    i need it to get timestamp
-    curate used this to know who had to contribute more for next round.
-
-
-
-    how to do the fundingPeriod contribute, appeal logic
-    if calling "appealPeriod" is cheap:
-    just query every contribute or appeal func.
-
-    if it's expensive:
-    check "appealDeadline" (the timestamp in dispute)
-    if you're over it, call appealPeriod. if 0, 0, you can't contribute or appeal.
-    if you get something different, you check if you're under "end".
-    if so, rewrite appealDeadline with end.
-    otherwise, revert.
-
-    actually i dont need to store uint256 rulings XD
-    (in curate) there are only 3 possible rulings.
-    just store it in a single slot.
-
-    remember to make "withdrawRoundZero". unsure if I already wrote this down.
-
-    i think you could get away with not reading settings for requesterStake
-    if instead you read the msg.value from the event and check yourself if it matches the required amount
-    if it doesn't, ignore it in subgraph and frontend
-    whoever chooses to interact with it, it's at risk.
-    mm... that may force to save amount somewhere, like the slot
-    otherwise if it gets "resolved" then the requester can drain value
-    i dont think that is feasible
-    (check later how much would this save. if it's over 1k gas, consider.)
-
 */
 
 contract SlotCurate is IArbitrable, IEvidence {
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
   uint256 internal constant RULING_OPTIONS = 2;
   uint256 internal constant DIVIDER = 1_000_000;
+
+  // TODO set constants such as INIT_ADD_ITEM_REQUEST = 128, to add clarity to contract
+  // instead of magic numbers everywhere
+  // you can add an explanation above of the func and why consts are what they are
 
   enum ProcessType {
     Add,
@@ -405,6 +240,8 @@ contract SlotCurate is IArbitrable, IEvidence {
   // in the contract, listIndex and settingsId are trusted.
   // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
   // then item will be ignored or marked as invalid.
+
+  // fix for all requests
   function addItem(
     uint64 _listIndex,
     uint48 _settingsId,
@@ -414,11 +251,12 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_idSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    Settings storage settings = settingsMap[_settingsId];
-    require(msg.value >= settings.requesterStake, "Not enough to cover stake");
+    // TODO the requesterStake is uint80 (compressed) but compared against uint256 msg.value
+    require(msg.value >= settingsMap[_settingsId].requesterStake, "Not enough to cover stake");
     // used: true, disputed: false, processType: Add
-    uint8 slotdata = paramsToSlotdata(true, false, ProcessType.Add);
-    slot.slotdata = slotdata;
+    // paramsToSlotdata(true, false, ProcessType.Add) = 128
+    // TODO same improvement for all other requests
+    slot.slotdata = 128;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
@@ -858,7 +696,7 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   function paramsToSlotdata(
     bool _used,
-    bool _disputed,
+    bool _disputed, // you store disputed to stop someone from calling executeRequest
     ProcessType _processType
   ) public pure returns (uint8) {
     uint8 usedAddend;
