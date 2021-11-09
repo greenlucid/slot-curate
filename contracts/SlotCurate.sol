@@ -313,15 +313,20 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId);
   event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
+
+  // how to tell if DisputeSlot is now used? You need to emit an event here
+  // because the Challenge event in Arbitrator only knows about external disputeId
+  // these events allow the subgraph to know the status of DisputeSlots
+  event RequestChallenged(uint64 _slotIndex, uint64 _disputeSlot);
+  event FreedDisputeSlot(uint64 _disputeSlot);
+
   event RequestAccepted(uint64 _slotIndex);
   event RequestRejected(uint64 _slotIndex);
-  event WhitelistChange(address _arbitrator, bool _status);
-  event GovernorChange(address _governor);
 
   // CONTRACT STORAGE //
 
-  address internal governor; // governor can whitelist arbitrators.
-  IArbitrator internal immutable arbitrator;
+
+  IArbitrator immutable internal arbitrator;
   uint64 internal listCount;
   uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
 
@@ -335,8 +340,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(uint256 => StoredRuling) internal storedRulings; // storedRulings[disputeId]
 
-  constructor(address _governor, address _arbitrator) {
-    governor = _governor;
+  constructor(address _arbitrator) {
     arbitrator = IArbitrator(_arbitrator);
   }
 
@@ -554,6 +558,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     roundContributions.appealCost = 0;
     roundContributions.partyTotal[0] = 0;
     roundContributions.partyTotal[1] = 0;
+
+    emit RequestChallenged(_slotIndex, _disputeSlot);
   }
 
   function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot) public payable {
@@ -682,6 +688,7 @@ contract SlotCurate is IArbitrable, IEvidence {
       // this was last contrib remaining
       // no need to decrement pendingWithdraws if last. save gas.
       dispute.state = DisputeState.Free;
+      emit FreedDisputeSlot(_disputeSlot);
     } else {
       dispute.pendingWithdraws--;
     }
@@ -707,6 +714,7 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     if (dispute.pendingWithdraws == 0) {
       dispute.state = DisputeState.Free;
+      emit FreedDisputeSlot(_disputeSlot);
     } else {
       dispute.pendingInitialWithdraw = false;
     }
@@ -765,14 +773,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
     // afterwards, set the dispute slot to Free.
     dispute.state = DisputeState.Free;
-  }
-
-  // governor functions
-
-  function changeGovernor(address _governor) public {
-    require(msg.sender == governor, "Only governor changes this");
-    governor = _governor;
-    emit GovernorChange(_governor);
   }
 
   // PRIVATE FUNCTIONS
