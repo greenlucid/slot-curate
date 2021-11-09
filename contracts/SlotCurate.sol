@@ -322,11 +322,9 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   event RequestAccepted(uint64 _slotIndex);
   event RequestRejected(uint64 _slotIndex);
-  event GovernorChange(address _governor);
 
   // CONTRACT STORAGE //
 
-  address internal governor; // governor can whitelist arbitrators.
   IArbitrator immutable internal arbitrator;
   uint64 internal listCount;
   uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
@@ -341,8 +339,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(uint256 => StoredRuling) internal storedRulings; // storedRulings[disputeId]
 
-  constructor(address _governor, address _arbitrator) {
-    governor = _governor;
+  constructor(address _arbitrator) {
     arbitrator = IArbitrator(_arbitrator);
   }
 
@@ -781,14 +778,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
     // afterwards, set the dispute slot to Free.
     dispute.state = DisputeState.Free;
-  }
-
-  // governor functions
-
-  function changeGovernor(address _governor) public {
-    require(msg.sender == governor, "Only governor changes this");
-    governor = _governor;
-    emit GovernorChange(_governor);
   }
 
   // PRIVATE FUNCTIONS
