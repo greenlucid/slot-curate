@@ -128,29 +128,18 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
   // _requesterStake, _requestPeriod,
-  event SettingsCreated(uint256 _requesterStake, uint40 _requestPeriod);
+  event SettingsCreated(uint80 _requesterStake, uint40 _requestPeriod, bytes _arbitratorExtraData);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
-  // this will be bad in rollups
-  // TODO verify this experimentally, because it might not be the case. its bad to emit more than needed
-  // you could check if listId < listCount in subgraph, and ignore
-  // and do settingsId = list[listId].settingsId
-  // requesterStake = settingsMap[settingsId].requesterStake
-  // slot.settingsId = settingsId
-  // also check how expensive is to check listId < listcount in contract!!!!! TODO
-  // because then you wont have to deal with it at subgraph level -AT ALL-
-
-  // YOU CAN SAVE 1k by compressing data before emitting the event
-  // because of how topics work
-  // compress all small params into one bytesXX. deal with it in subgraph.
   
-  // every byte costs 8 gas so 80 gas saving by publishing bytes22
+  // every byte costs 8 gas so 80 gas saving by publishing uint176
   event ItemAddRequest(uint176 _addRequestData, string _ipfsUri);
-  // changing to bytes30 saves less gas than just using bytes32
   event ItemRemovalRequest(uint240 _removalRequestData);
   event ItemEditRequest(uint240 _editRequestData, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
+  event RequestAccepted(uint64 _slotIndex);
+  event RequestRejected(uint64 _slotIndex);
 
   // how to tell if DisputeSlot is now used? You need to emit an event here
   // because the Challenge event in Arbitrator only knows about external disputeId
@@ -158,8 +147,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   event RequestChallenged(uint64 _slotIndex, uint64 _disputeSlot);
   event FreedDisputeSlot(uint64 _disputeSlot);
 
-  event RequestAccepted(uint64 _slotIndex);
-  event RequestRejected(uint64 _slotIndex);
 
   // CONTRACT STORAGE //
 
@@ -232,7 +219,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
-    emit SettingsCreated(_requesterStake, _requestPeriod);
+    emit SettingsCreated(_requesterStake, _requestPeriod, _arbitratorExtraData);
   }
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
