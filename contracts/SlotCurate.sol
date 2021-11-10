@@ -175,7 +175,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint48 _settingsId,
     address _governor,
     string calldata _ipfsUri
-  ) public {
+  ) external {
     require(_settingsId < settingsCount, "Settings must exist");
     // requiring that listCount != type(uint64).max is not needed. makes it ~1k more expensive
     // and listCount exceeding that number is just not gonna happen. ~32B years of filling blocks.
@@ -190,7 +190,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint48 _settingsId,
     address _newGovernor,
     string calldata _ipfsUri
-  ) public {
+  ) external {
     List storage list = lists[_listIndex];
     require(msg.sender == list.governor, "You need to be the governor");
     list.governor = _newGovernor;
@@ -202,10 +202,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint80 _requesterStake,
     uint40 _requestPeriod,
     bytes calldata _arbitratorExtraData,
-    string memory _addMetaEvidence,
-    string memory _removeMetaEvidence,
-    string memory _updateMetaEvidence
-  ) public {
+    string calldata _addMetaEvidence,
+    string calldata _removeMetaEvidence,
+    string calldata _updateMetaEvidence
+  ) external {
     // require is not used. there can be up to 281T.
     // that's 1M years of full 15M gas blocks every 13s.
     // skipping it makes this cheaper. overflow is not gonna happen.
@@ -234,7 +234,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint48 _settingsId,
     uint64 _idSlot,
     string calldata _ipfsUri
-  ) public payable {
+  ) external payable {
     Slot storage slot = slots[_idSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
@@ -257,9 +257,20 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint48 _settingsId,
     uint64 _fromSlot,
     string calldata _ipfsUri
-  ) public payable {
+  ) external payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    addItem(_listIndex, _settingsId, workSlot, _ipfsUri);
+    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    Slot storage slot = slots[workSlot];
+    // used: true, disputed: false, processType: Add
+    // paramsToSlotdata(true, false, ProcessType.Add) = 128
+    slot.slotdata = 128;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
+    // LLLLLLLLSSSSSSIIIIIIII
+    // move list 14, move settings 8, add idSlot.
+    emit ItemAddRequest(((_listIndex << 14) + (_settingsId << 8) + workSlot), _ipfsUri);
   }
 
   function removeItem(
@@ -267,7 +278,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint48 _settingsId,
     uint64 _listId,
     uint64 _itemId
-  ) public payable {
+  ) external payable {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
@@ -289,9 +300,20 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint48 _settingsId,
     uint64 _listId,
     uint64 _itemId
-  ) public payable {
+  ) external payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    removeItem(workSlot, _settingsId, _listId, _itemId);
+    Slot storage slot = slots[workSlot];
+    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Removal
+    // paramsToSlotdata(true, false, ProcessType.Removal) = 144
+    slot.slotdata = 144;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint240 removeRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    // move list 14, move settings 8, add idSlot.
+    emit ItemRemovalRequest((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
   }
 
   function editItem(
@@ -300,7 +322,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _listId,
     uint64 _itemId,
     string calldata _ipfsUri
-  ) public payable {
+  ) external payable {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
@@ -323,12 +345,23 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _listId,
     uint64 _itemId,
     string calldata _ipfsUri
-  ) public payable {
+  ) external payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
-    editItem(workSlot, _settingsId, _listId, _itemId, _ipfsUri);
+    Slot storage slot = slots[workSlot];
+    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Edit
+    // paramsToSlotdata(true, false, ProcessType.Edit) = 160
+    slot.slotdata = 160;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint240 editRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    // move list 14, move settings 8, add idSlot.
+    emit ItemEditRequest(((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
   }
 
-  function executeRequest(uint64 _slotIndex) public {
+  function executeRequest(uint64 _slotIndex) external {
     Slot storage slot = slots[_slotIndex];
     Settings storage settings = settingsMap[slot.settingsId];
     require(slotIsExecutable(slot, settings.requestPeriod), "Slot cannot be executed");
@@ -336,13 +369,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit RequestAccepted(_slotIndex);
     // used to false, others don't matter.
     slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
-  }
-
-  function challengeFee(uint64 _slotIndex) public view returns (uint256 arbitrationFee) {
-    Slot storage slot = slots[_slotIndex];
-    Settings storage settings = settingsMap[slot.settingsId];
-
-    arbitrationFee = arbitrator.arbitrationCost(settings.arbitratorExtraData);
   }
 
   function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
@@ -677,6 +703,13 @@ contract SlotCurate is IArbitrable, IEvidence {
   function slotCanBeChallenged(Slot memory _slot, uint40 requestPeriod) public view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used && !(block.timestamp > _slot.requestTime + requestPeriod) && !disputed;
+  }
+
+  function challengeFee(uint64 _slotIndex) public view returns (uint256 arbitrationFee) {
+    Slot storage slot = slots[_slotIndex];
+    Settings storage settings = settingsMap[slot.settingsId];
+
+    arbitrationFee = arbitrator.arbitrationCost(settings.arbitratorExtraData);
   }
 
   function paramsToSlotdata(
