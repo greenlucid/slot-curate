@@ -9,13 +9,13 @@ describe("SlotCurate", () => {
   });
 
   describe("Default", () => {
-    const REQUESTER_STAKE = 1_000_000_000;
-    const CHALLENGER_STAKE = 1_000_000_000;
+    const SETTINGS_REQUESTER_STAKE = 1; // this is compressed, so it's x / 2**AMOUNT_BITSHIFT
+    const VALUE_REQUESTER_STAKE = 4_300_000_000;
+    const CHALLENGE_FEE = 1_000_000_000;
     const REQUEST_PERIOD = 1_000;
-    const FUNDING_PERIOD = 1_000;
 
     it("Should create settings.", async () => {
-      const args = [REQUESTER_STAKE, REQUEST_PERIOD, "0x00", "add", "remove", "update"];
+      const args = [SETTINGS_REQUESTER_STAKE, REQUEST_PERIOD, "0x00", "add", "remove", "update"];
 
       await expect(slotCurate.connect(deployer).createSettings(...args))
         .to.emit(slotCurate, "SettingsCreated")
@@ -47,7 +47,7 @@ describe("SlotCurate", () => {
     it("Should add item.", async () => {
       const args = [0, 0, 0, "/ipfs/QmYs17mAJTaQwYeXNTb6n4idoQXmRcAjREeUdjJShNSeKh"];
 
-      await expect(slotCurate.connect(requester).addItem(...args, { value: REQUESTER_STAKE }))
+      await expect(slotCurate.connect(requester).addItem(...args, { value: VALUE_REQUESTER_STAKE }))
         .to.emit(slotCurate, "ItemAddRequest")
         .withArgs(...args.slice(0, 4));
     });
@@ -67,7 +67,7 @@ describe("SlotCurate", () => {
     it("Should remove an item.", async () => {
       const args = [0, 0, 0, 0];
 
-      await slotCurate.connect(requester).removeItem(...args, { value: REQUESTER_STAKE });
+      await slotCurate.connect(requester).removeItem(...args, { value: VALUE_REQUESTER_STAKE });
       await ethers.provider.send("evm_increaseTime", [REQUEST_PERIOD + 1]);
       await slotCurate.connect(requester).executeRequest(args[3]);
     });
@@ -75,28 +75,28 @@ describe("SlotCurate", () => {
     it("Should let you add an item using a freed slot.", async () => {
       const args = [0, 0, 0, "/ipfs/QmYs17mAJTaQwYeXNTb6n4idoQXmRcAjREeUdjJShNSeKh"];
 
-      await slotCurate.connect(requester).addItem(...args, { value: REQUESTER_STAKE });
+      await slotCurate.connect(requester).addItem(...args, { value: VALUE_REQUESTER_STAKE });
     });
 
     it("Should let you add an item, finding a vacant slot automatically.", async () => {
       const args = [0, 0, 0, "/ipfs/QmYs17mAJTaQwYeXNTb6n4idoQXmRcAjREeUdjJShNSeKh"];
 
-      await slotCurate.connect(requester).addItemInFirstFreeSlot(...args, { value: REQUESTER_STAKE });
+      await slotCurate.connect(requester).addItemInFirstFreeSlot(...args, { value: VALUE_REQUESTER_STAKE });
     });
 
     it("Should let you edit an item, finding a vacant slot automatically.", async () => {
       const args = [0, 0, 0, 0, "/ipfs/QmYs17mAJTabcabcabcabcabcabacaAjREeUdjJShNSeKh"];
 
-      await slotCurate.connect(requester).editItemInFirstFreeSlot(...args, { value: REQUESTER_STAKE });
+      await slotCurate.connect(requester).editItemInFirstFreeSlot(...args, { value: VALUE_REQUESTER_STAKE });
     });
 
-    /*it("Should challenge an item.", async () => {
+    it("Should challenge an item.", async () => {
       const args = [0, 0];
 
       const CHALLENGE_FEE = await slotCurate.connect(innocentBystander).challengeFee(args[0]);
 
       await slotCurate.connect(requester).challengeRequest(...args, { value: CHALLENGE_FEE });
-    });*/
+    });
   });
 });
 

@@ -10,7 +10,7 @@ import "@kleros/erc-792/contracts/IArbitrator.sol";
  */
 contract Arbitrator is IArbitrator {
   address public governor = msg.sender;
-  uint256 internal arbitrationPrice = 1_000_000_000_000_000_000;
+  uint256 internal arbitrationPrice = 1_000_000_000;
 
   struct Dispute {
     IArbitrable arbitrated;
