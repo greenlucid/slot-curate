@@ -184,7 +184,6 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // PUBLIC FUNCTIONS
 
-  // lists
   function createList(
     uint48 _settingsId,
     address _governor,
@@ -212,8 +211,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit ListUpdated(_listIndex, _settingsId, _newGovernor, _ipfsUri);
   }
 
-  // settings
-  // bit of a draft since I havent done the dispute side of things yet
   function createSettings(
     uint80 _requesterStake,
     uint40 _requestPeriod,
@@ -257,7 +254,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Add
     // paramsToSlotdata(true, false, ProcessType.Add) = 128
-    // TODO same improvement for all other requests
     slot.slotdata = 128;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -279,13 +275,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     addItem(_listIndex, _settingsId, workSlot, _ipfsUri);
   }
 
-  // list is checked in subgraph. settings is trusted here.
-  // if settings was not the one settings in subgraph at the time,
-  // then subgraph will ignore the removal (so it has no effect when exec.)
-  // could even be challenged as an ilegal request to extract the stake, if significant.
-
-  // TODO ponder about using workSlot, listId and itemId instead.
-  // because these are given by the subgraph
   function removeItem(
     uint64 _workSlot,
     uint48 _settingsId,
@@ -297,7 +286,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(slot.slotdata < 128, "Slot must not be in use");
     require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Removal
-    // paramsToSlotdata(true, false, ProcessType.Removal) = 128 + 16 = 144
+    // paramsToSlotdata(true, false, ProcessType.Removal) = 144
     slot.slotdata = 144;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -767,7 +756,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     return (uint256(_compressedAmount) << AMOUNT_BITSHIFT);
   }
 
-  // thanks to this func we could possibly do without the above func.
   function whichPartyWon(uint248 _ruling) public pure returns (Party) {
     if (_ruling == 0 || _ruling == 1) {
       return Party.Requester;
