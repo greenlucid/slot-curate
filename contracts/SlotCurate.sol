@@ -143,10 +143,13 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // YOU CAN SAVE 1k by compressing data before emitting the event
   // because of how topics work
-  // compress all small params into one bytes32. deal with it in subgraph.
-  event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _idSlot, string _ipfsUri);
-  event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId);
-  event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId, string _ipfsUri);
+  // compress all small params into one bytesXX. deal with it in subgraph.
+  
+  // every byte costs 8 gas so 80 gas saving by publishing bytes22
+  event ItemAddRequest(bytes32 _addRequestData, string _ipfsUri);
+  // changing to bytes30 saves less gas than just using bytes32
+  event ItemRemovalRequest(bytes32 _removalRequestData);
+  event ItemEditRequest(bytes32 _editRequestData, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
 
   // how to tell if DisputeSlot is now used? You need to emit an event here
@@ -259,7 +262,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
+    emit ItemAddRequest(bytesToBytes32(bytes.concat(bytes8(_listIndex), bytes6(_settingsId), bytes8(_idSlot))), _ipfsUri);
   }
 
   // frontrunning protection
@@ -296,7 +299,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemRemovalRequest(_workSlot, _settingsId, _listId, _itemId);
+    emit ItemRemovalRequest(bytesToBytes32(bytes.concat(bytes8(_workSlot), bytes6(_settingsId), bytes8(_listId), bytes8(_itemId))));
   }
 
   function removeItemInFirstFreeSlot(
@@ -326,7 +329,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemEditRequest(_workSlot, _settingsId, _listId, _itemId, _ipfsUri);
+    emit ItemEditRequest(bytesToBytes32(bytes.concat(bytes8(_workSlot), bytes6(_settingsId), bytes8(_listId), bytes8(_itemId))), _ipfsUri);
   }
 
   function editItemInFirstFreeSlot(
@@ -762,5 +765,15 @@ contract SlotCurate is IArbitrable, IEvidence {
     } else {
       return Party.Challenger;
     }
+  }
+
+  // to pack events
+  function bytesToBytes32(bytes memory b) private pure returns (bytes32) {
+    bytes32 out;
+
+    for (uint i = 0; i < 32; i++) {
+      out |= bytes32(b[i] & 0xFF) >> (i * 8);
+    }
+    return out;
   }
 }

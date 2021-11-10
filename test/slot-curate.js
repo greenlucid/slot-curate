@@ -49,7 +49,6 @@ describe("SlotCurate", () => {
 
       await expect(slotCurate.connect(requester).addItem(...args, { value: VALUE_REQUESTER_STAKE }))
         .to.emit(slotCurate, "ItemAddRequest")
-        .withArgs(...args.slice(0, 4));
     });
 
     it("Should should not let you add an item using an occupied slot.", async () => {
