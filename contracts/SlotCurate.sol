@@ -143,10 +143,13 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // YOU CAN SAVE 1k by compressing data before emitting the event
   // because of how topics work
-  // compress all small params into one bytes32. deal with it in subgraph.
-  event ItemAddRequest(uint64 _listIndex, uint48 _settingsId, uint64 _idSlot, string _ipfsUri);
-  event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId);
-  event ItemEditRequest(uint64 _workSlot, uint48 _settingsId, uint64 _listId, uint64 _itemId, string _ipfsUri);
+  // compress all small params into one bytesXX. deal with it in subgraph.
+  
+  // every byte costs 8 gas so 80 gas saving by publishing bytes22
+  event ItemAddRequest(uint176 _addRequestData, string _ipfsUri);
+  // changing to bytes30 saves less gas than just using bytes32
+  event ItemRemovalRequest(uint240 _removalRequestData);
+  event ItemEditRequest(uint240 _editRequestData, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
 
   // how to tell if DisputeSlot is now used? You need to emit an event here
@@ -259,7 +262,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemAddRequest(_listIndex, _settingsId, _idSlot, _ipfsUri);
+    // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
+    // LLLLLLLLSSSSSSIIIIIIII
+    // move list 14, move settings 8, add idSlot.
+    emit ItemAddRequest(((_listIndex << 14) + (_settingsId << 8) + _idSlot), _ipfsUri);
   }
 
   // frontrunning protection
@@ -296,7 +302,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemRemovalRequest(_workSlot, _settingsId, _listId, _itemId);
+    // format of uint240 removeRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    // move list 14, move settings 8, add idSlot.
+    emit ItemRemovalRequest((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
   }
 
   function removeItemInFirstFreeSlot(
@@ -326,7 +335,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
     slot.settingsId = _settingsId;
-    emit ItemEditRequest(_workSlot, _settingsId, _listId, _itemId, _ipfsUri);
+    // format of uint240 editRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    // move list 14, move settings 8, add idSlot.
+    emit ItemEditRequest(((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
   }
 
   function editItemInFirstFreeSlot(
