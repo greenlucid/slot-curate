@@ -21,6 +21,17 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 
     put the most used functions (add, remove item) as first functions because that
     makes it cheaper
+    actually:
+    it's not based on order, but on the hash of the function string definition.
+    the function hashes are ordered in some way
+    functions that come last cost extra 22 gas per every function that is checked before
+    there are 32 public funcs, so the one that comes last will cost 31 * 22 = 682 extra gas.
+    so the main function "addItem", assuming is roughly in the middle, costs 341 extra gas.
+    ~0.2 USD at current price
+    if you make it the first function (by naming it addItem4, for example), you save it.
+    this optimization is WIP because gas savings
+    have been lower than expected (~100 gas). TODO look into it
+
 
     consider should we have remover / challenger submit "reason", somehow? as another ipfs.
     that'd make those events ~2k more expensive
@@ -33,10 +44,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
   uint256 internal constant RULING_OPTIONS = 2;
   uint256 internal constant DIVIDER = 1_000_000;
-
-  // TODO set constants such as INIT_ADD_ITEM_REQUEST = 128, to add clarity to contract
-  // instead of magic numbers everywhere
-  // you can add an explanation above of the func and why consts are what they are
 
   enum ProcessType {
     Add,
