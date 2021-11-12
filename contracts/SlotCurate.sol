@@ -208,6 +208,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   function createSettings(
     uint80 _requesterStake,
     uint40 _requestPeriod,
+    uint64 _multiplier,
     bytes calldata _arbitratorExtraData,
     string calldata _addMetaEvidence,
     string calldata _removeMetaEvidence,
@@ -221,6 +222,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Settings storage settings = settingsMap[settingsCount++];
     settings.requesterStake = _requesterStake;
     settings.requestPeriod = _requestPeriod;
+    settings.multiplier = _multiplier;
     settings.arbitratorExtraData = _arbitratorExtraData;
 
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
