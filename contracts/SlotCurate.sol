@@ -227,7 +227,7 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
-    emit MetaEvidence(3 * settingsCount + 1, _updateMetaEvidence);
+    emit MetaEvidence(3 * settingsCount + 2, _updateMetaEvidence);
     emit SettingsCreated(_requesterStake, _requestPeriod, _arbitratorExtraData);
   }
 
