@@ -32,31 +32,9 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     this optimization is WIP because gas savings
     have been lower than expected (~100 gas). TODO look into it
 
-
-    consider should we have remover / challenger submit "reason", somehow? as another ipfs.
-    that'd make those events ~2k more expensive
-    but should make the challenging / removing process more healthy.
-    if the removal / challenging reason is proved wrong, then even if the item somehow
-    doesn't belong there, it is allowed.
-
     Current TODO
 
-    move lists to subgraph. handle them completely in subgraph.
-    fix Evidence:
-    - wtf is MetaEvidence?
-    - how to create evidenceGroupId?
-      - you can do it with slotId + timestamp pair, but that will create new, different
-      evidenceGroupIds per request. which means, you will not be able to read the Evidence
-      from previous requests belonging to same object.
-      - you can do it with itemId + listId pair. that allows watching all the evidence related
-      to the requests of the item. with one exception: the request that adds the item.
-      this is because, at that time, the item doesn't have a
-      - there's something else. you can set the way to construct the evidenceGroupId at challenge
-      you store something in the subgraph, or in the disputeSlot. not sure.
-      - or, you could store something related to the item the moment it is constructed
-      (e.g. slotId + timestamp)
-      and drag it around and always remember it in the subgraph. it will be the evidenceGroupId
-      related to that item's lifetime from that point on.
+    why not compress the function arguments? saves ~300 gas per argument...
 */
 
 contract SlotCurate is IArbitrable, IEvidence {
@@ -148,7 +126,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
   event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
   // _requesterStake, _requestPeriod,
-  event SettingsCreated(uint80 _requesterStake, uint40 _requestPeriod, bytes _arbitratorExtraData);
+  event SettingsCreated(uint80 _requesterStake, uint40 _requestPeriod, uint64 multiplier, bytes _arbitratorExtraData);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
@@ -233,7 +211,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
     emit MetaEvidence(3 * settingsCount + 2, _updateMetaEvidence);
-    emit SettingsCreated(_requesterStake, _requestPeriod, _arbitratorExtraData);
+    emit SettingsCreated(_requesterStake, _requestPeriod, _multiplier, _arbitratorExtraData);
   }
 
   // no refunds for overpaying. consider it burned. refunds are bloat.
@@ -291,7 +269,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _workSlot,
     uint48 _settingsId,
     uint64 _listId,
-    uint64 _itemId
+    uint64 _itemId,
+    string calldata _reason
   ) external payable {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
@@ -307,13 +286,17 @@ contract SlotCurate is IArbitrable, IEvidence {
     // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
     // move list 14, move settings 8, add idSlot.
     emit ItemRemovalRequest((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
+    // the evidenceGroupId is the one of this one request.
+    uint evidenceGroupId = uint(keccak256(abi.encodePacked(_workSlot, uint40(block.timestamp))));
+    emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
   function removeItemInFirstFreeSlot(
     uint64 _fromSlot,
     uint48 _settingsId,
     uint64 _listId,
-    uint64 _itemId
+    uint64 _itemId,
+    string calldata _reason
   ) external payable {
     uint64 workSlot = firstFreeSlot(_fromSlot);
     Slot storage slot = slots[workSlot];
@@ -328,6 +311,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
     // move list 14, move settings 8, add idSlot.
     emit ItemRemovalRequest((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
+    // the evidenceGroupId is the one of this one request.
+    uint evidenceGroupId = uint(keccak256(abi.encodePacked(workSlot, uint40(block.timestamp))));
+    emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
   function editItem(
@@ -385,7 +371,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
   }
 
-  function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
+  function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot, string calldata _reason) public payable {
     Slot storage slot = slots[_slotIndex];
     Settings storage settings = settingsMap[slot.settingsId];
     require(slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
@@ -423,11 +409,20 @@ contract SlotCurate is IArbitrable, IEvidence {
     roundContributions.partyTotal[1] = 0;
 
     emit RequestChallenged(_slotIndex, _disputeSlot);
+
+    // the evidenceGroupId is obtained from the slot of the challenged request
+    uint evidenceGroupId = uint(keccak256(abi.encodePacked(_slotIndex, slot.requestTime)));
+    emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
-  function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot) public payable {
+  function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot, string calldata _reason) public payable {
     uint64 disputeWorkSlot = firstFreeDisputeSlot(_fromSlot);
-    challengeRequest(_slotIndex, disputeWorkSlot);
+    challengeRequest(_slotIndex, disputeWorkSlot, _reason);
+  }
+
+  function submitEvidence(uint _evidenceGroupId, string calldata _evidence) external {
+    // you can just submit evidence directly to any _evidenceGroupId
+    emit Evidence(arbitrator, _evidenceGroupId, msg.sender, _evidence);
   }
 
   function contribute(uint64 _disputeSlot, Party _party) public payable {
@@ -678,12 +673,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   function _refundContribution(Contribution memory _contribution) private {
     uint256 refund = decompressAmount(_contribution.amount);
     payable(_contribution.contributor).transfer(refund);
-  }
-
-  function submitEvidence(uint64 _disputeSlot, string calldata _evidenceURI) external {
-    DisputeSlot storage dispute = disputes[_disputeSlot];
-
-    emit Evidence(arbitrator, dispute.arbitratorDisputeId, msg.sender, _evidenceURI);
   }
 
   // VIEW FUNCTIONS
