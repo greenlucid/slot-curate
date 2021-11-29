@@ -38,6 +38,25 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     but should make the challenging / removing process more healthy.
     if the removal / challenging reason is proved wrong, then even if the item somehow
     doesn't belong there, it is allowed.
+
+    Current TODO
+
+    move lists to subgraph. handle them completely in subgraph.
+    fix Evidence:
+    - wtf is MetaEvidence?
+    - how to create evidenceGroupId?
+      - you can do it with slotId + timestamp pair, but that will create new, different
+      evidenceGroupIds per request. which means, you will not be able to read the Evidence
+      from previous requests belonging to same object.
+      - you can do it with itemId + listId pair. that allows watching all the evidence related
+      to the requests of the item. with one exception: the request that adds the item.
+      this is because, at that time, the item doesn't have a
+      - there's something else. you can set the way to construct the evidenceGroupId at challenge
+      you store something in the subgraph, or in the disputeSlot. not sure.
+      - or, you could store something related to the item the moment it is constructed
+      (e.g. slotId + timestamp)
+      and drag it around and always remember it in the subgraph. it will be the evidenceGroupId
+      related to that item's lifetime from that point on.
 */
 
 contract SlotCurate is IArbitrable, IEvidence {
@@ -76,12 +95,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     // even, if arb doesn't need a lot of data
     // you can just store it in the free space.
     // e.g. KlerosLiquid uses like 32 bits of data max.
-  }
-
-  struct List {
-    uint48 settingsId;
-    address governor; // governors can change governor of the list, and change settingsId
-    uint48 freeSpace;
   }
 
   struct Slot {
@@ -133,7 +146,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   // EVENTS //
 
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
-  event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
+  event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
   // _requesterStake, _requestPeriod,
   event SettingsCreated(uint80 _requesterStake, uint40 _requestPeriod, bytes _arbitratorExtraData);
   // why emit settingsId in the request events?
@@ -159,12 +172,11 @@ contract SlotCurate is IArbitrable, IEvidence {
 
 
   IArbitrator immutable internal arbitrator;
-  uint64 internal listCount;
-  uint48 internal settingsCount; // to prevent from assigning invalid settings to lists.
+  uint48 internal settingsCount; // settings have to be stored, this gives unique, ordered ids, and allows to check
+  // if settings exist.
 
   mapping(uint64 => Slot) internal slots;
   mapping(uint64 => DisputeSlot) internal disputes;
-  mapping(uint64 => List) internal lists;
   // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
   mapping(uint48 => Settings) internal settingsMap;
   mapping(uint64 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
@@ -178,31 +190,24 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // PUBLIC FUNCTIONS
 
+  // list is completely stored in the subgraph, and assigned a listId depending on the amount of lists existing.
   function createList(
     uint48 _settingsId,
     address _governor,
     string calldata _ipfsUri
   ) external {
-    require(_settingsId < settingsCount, "Settings must exist");
-    // requiring that listCount != type(uint64).max is not needed. makes it ~1k more expensive
-    // and listCount exceeding that number is just not gonna happen. ~32B years of filling blocks.
-    List storage list = lists[listCount++];
-    list.governor = _governor;
-    list.settingsId = _settingsId;
+    // the following statement is not needed because it will be verified in the subgraph
+    // require(_settingsId < settingsCount, "Settings must exist");
     emit ListCreated(_settingsId, _governor, _ipfsUri);
   }
 
+  // subgraph won't accept the update if the msg.sender is not the _governor of the list
   function updateList(
     uint64 _listIndex,
     uint48 _settingsId,
-    address _newGovernor,
-    string calldata _ipfsUri
+    address _newGovernor
   ) external {
-    List storage list = lists[_listIndex];
-    require(msg.sender == list.governor, "You need to be the governor");
-    list.governor = _newGovernor;
-    list.settingsId = _settingsId;
-    emit ListUpdated(_listIndex, _settingsId, _newGovernor, _ipfsUri);
+    emit ListUpdated(_listIndex, _settingsId, _newGovernor);
   }
 
   function createSettings(
