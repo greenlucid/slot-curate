@@ -162,8 +162,17 @@ contract SlotCurate is IArbitrable, IEvidence {
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(uint256 => StoredRuling) internal storedRulings; // storedRulings[disputeId]
 
-  constructor(address _arbitrator) {
+  constructor(
+    address _arbitrator,
+    string memory _addMetaEvidence,
+    string memory _removalMetaEvidence,
+    string memory _editMetaEvidence
+  ) {
     arbitrator = IArbitrator(_arbitrator);
+
+    emit MetaEvidence(0, _addMetaEvidence);
+    emit MetaEvidence(1, _removalMetaEvidence);
+    emit MetaEvidence(2, _editMetaEvidence);
   }
 
   // PUBLIC FUNCTIONS
@@ -192,10 +201,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint80 _requesterStake,
     uint40 _requestPeriod,
     uint64 _multiplier,
-    bytes calldata _arbitratorExtraData,
-    string calldata _addMetaEvidence,
-    string calldata _removeMetaEvidence,
-    string calldata _updateMetaEvidence
+    bytes calldata _arbitratorExtraData
   ) external {
     // require is not used. there can be up to 281T.
     // that's 1M years of full 15M gas blocks every 13s.
@@ -207,10 +213,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     settings.requestPeriod = _requestPeriod;
     settings.multiplier = _multiplier;
     settings.arbitratorExtraData = _arbitratorExtraData;
-
-    emit MetaEvidence(3 * settingsCount, _addMetaEvidence);
-    emit MetaEvidence(3 * settingsCount + 1, _removeMetaEvidence);
-    emit MetaEvidence(3 * settingsCount + 2, _updateMetaEvidence);
     emit SettingsCreated(_requesterStake, _requestPeriod, _multiplier, _arbitratorExtraData);
   }
 
@@ -409,9 +411,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     roundContributions.partyTotal[1] = 0;
 
     emit RequestChallenged(_slotIndex, _disputeSlot);
-
+    // ERC 1497
     // the evidenceGroupId is obtained from the slot of the challenged request
     uint evidenceGroupId = uint(keccak256(abi.encodePacked(_slotIndex, slot.requestTime)));
+    emit Dispute(arbitrator, arbitratorDisputeId, uint(processType), evidenceGroupId);
     emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
