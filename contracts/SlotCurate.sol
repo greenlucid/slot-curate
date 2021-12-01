@@ -35,8 +35,6 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     Current TODO
 
     why not compress the function arguments? saves ~300 gas per argument...
-
-    make a bunch of pure funcs internal to lower the cost of all external funcs
 */
 
 contract SlotCurate is IArbitrable, IEvidence {
@@ -96,10 +94,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     bool pendingInitialWithdraw;
     uint8 freeSpace;
     uint64 nContributions;
-    uint64 pendingWithdraws;
+    uint64[2] pendingWithdraws; // pendingWithdraws[_party]
     uint40 appealDeadline;
     Party winningParty; // for withdrawals, set at rule()
-    uint80 freeSpace2;
+    uint16 freeSpace2;
   }
 
   struct Contribution {
@@ -400,7 +398,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     dispute.currentRound = 0;
     dispute.pendingInitialWithdraw = true;
     dispute.nContributions = 0;
-    dispute.pendingWithdraws = 0;
+    dispute.pendingWithdraws[0] = 0;
+    dispute.pendingWithdraws[1] = 0;
     dispute.appealDeadline = 0;
     // you don't need to reset dispute.winningParty because it's not used until Withdrawing
     // and to get to Withdrawing (in rule() function) you set the dispute.winningParty there
@@ -443,7 +442,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     // pendingWithdrawal = true, party = _party
     uint8 contribdata = paramsToContribdata(true, _party);
     dispute.nContributions++;
-    dispute.pendingWithdraws++;
+    dispute.pendingWithdraws[uint(_party)]++;
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
     uint80 amount = compressAmount(msg.value);
     roundContributionsMap[_disputeSlot][nextRound].partyTotal[uint256(_party)] += amount;
@@ -529,11 +528,12 @@ contract SlotCurate is IArbitrable, IEvidence {
     // okay, all checked. let's get the contribution.
 
     RoundContributions memory roundContributions = roundContributionsMap[_disputeSlot][contribution.round];
+    Party winningParty = dispute.winningParty;
 
     if (roundContributions.appealCost != 0) {
       // then this is a contribution from an appealed round.
       // only winner party can withdraw.
-      require(party == dispute.winningParty, "That side lost the dispute");
+      require(party == winningParty, "That side lost the dispute");
 
       _withdrawSingleReward(contribution, roundContributions, party);
     } else {
@@ -543,13 +543,13 @@ contract SlotCurate is IArbitrable, IEvidence {
       payable(contribution.contributor).transfer(refund);
     }
 
-    if (dispute.pendingWithdraws == 1 && !dispute.pendingInitialWithdraw) {
+    if (dispute.pendingWithdraws[uint(winningParty)] == 1 && !dispute.pendingInitialWithdraw) {
       // this was last contrib remaining
       // no need to decrement pendingWithdraws if last. saves gas.
       dispute.state = DisputeState.Free;
       emit FreedDisputeSlot(_disputeSlot);
     } else {
-      dispute.pendingWithdraws--;
+      dispute.pendingWithdraws[uint(winningParty)]--;
       // set contribution as withdrawn. party doesn't matter, so it's chosen as Party.Requester
       // (pendingWithdrawal = false, party = Party.Requester) => paramsToContribution(false, Party.Requester) = 0
       contribution.contribdata = 0;
@@ -570,10 +570,10 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     // withdraw it. this can be put onto its own private func.
 
-    Party party = dispute.winningParty;
-    _withdrawRoundZero(dispute, settings, slot, party);
+    Party winningParty = dispute.winningParty;
+    _withdrawRoundZero(dispute, settings, slot, winningParty);
 
-    if (dispute.pendingWithdraws == 0) {
+    if (dispute.pendingWithdraws[uint(winningParty)] == 0) {
       dispute.state = DisputeState.Free;
       emit FreedDisputeSlot(_disputeSlot);
     } else {
