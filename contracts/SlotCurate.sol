@@ -35,6 +35,8 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     Current TODO
 
     why not compress the function arguments? saves ~300 gas per argument...
+
+    make a bunch of pure funcs internal to lower the cost of all external funcs
 */
 
 contract SlotCurate is IArbitrable, IEvidence {
@@ -368,7 +370,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     payable(slot.requester).transfer(settings.requesterStake);
     emit RequestAccepted(_slotIndex);
     // used to false, others don't matter.
-    slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
+    // paramsToSlotdata(false, false, ProcessType.Add) = 0
+    slot.slotdata = 0;
   }
 
   function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot, string calldata _reason) public payable {
@@ -506,7 +509,8 @@ contract SlotCurate is IArbitrable, IEvidence {
       dispute.winningParty = Party.Challenger;
     }
     // 5. slot is now Free.. other slotdata doesn't matter.
-    slot.slotdata = paramsToSlotdata(false, false, ProcessType.Add);
+    // paramsToSlotdata(false, false, ProcessType.Add) = 0
+    slot.slotdata = 0;
     dispute.state = DisputeState.Withdrawing;
     emit Ruling(arbitrator, _disputeId, _ruling);
   }
@@ -721,7 +725,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     bool _used,
     bool _disputed, // you store disputed to stop someone from calling executeRequest
     ProcessType _processType
-  ) public pure returns (uint8) {
+  ) internal pure returns (uint8) {
     uint8 usedAddend;
     if (_used) usedAddend = 128;
     uint8 disputedAddend;
@@ -734,7 +738,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   function slotdataToParams(uint8 _slotdata)
-    public
+    internal
     pure
     returns (
       bool,
@@ -753,7 +757,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     return (used, disputed, processType);
   }
 
-  function paramsToContribdata(bool _pendingWithdrawal, Party _party) public pure returns (uint8) {
+  function paramsToContribdata(bool _pendingWithdrawal, Party _party) internal pure returns (uint8) {
     uint8 pendingWithdrawalAddend;
     if (_pendingWithdrawal) pendingWithdrawalAddend = 128;
     uint8 partyAddend;
@@ -763,7 +767,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     return contribdata;
   }
 
-  function contribdataToParams(uint8 _contribdata) public pure returns (bool, Party) {
+  function contribdataToParams(uint8 _contribdata) internal pure returns (bool, Party) {
     uint8 pendingWithdrawalAddend = _contribdata & 128;
     bool pendingWithdrawal = pendingWithdrawalAddend != 0;
     uint8 partyAddend = _contribdata & 64;
@@ -773,11 +777,11 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   // always compress / decompress rounding down.
-  function compressAmount(uint256 _amount) public pure returns (uint80) {
+  function compressAmount(uint256 _amount) internal pure returns (uint80) {
     return (uint80(_amount >> AMOUNT_BITSHIFT));
   }
 
-  function decompressAmount(uint80 _compressedAmount) public pure returns (uint256) {
+  function decompressAmount(uint80 _compressedAmount) internal pure returns (uint256) {
     return (uint256(_compressedAmount) << AMOUNT_BITSHIFT);
   }
 }
