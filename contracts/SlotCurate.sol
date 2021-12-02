@@ -57,6 +57,8 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     yeah, remember that making this change will affect "withdrawRoundZero". it will be a function you
     can only reward the challenger.
     and, pendingInitialWithdraw must be set to false if the ruling is in favor of the request.
+
+    TODO prepend internal view funcs with _
 */
 
 /**
@@ -876,11 +878,10 @@ contract SlotCurate is IArbitrable, IEvidence {
   /** @dev Get the first free request slot from a given point.
    *  Relying on this in the frontend could result in collisions.
    *  This view function is used for the frontrun protection request functions.
-   *  TODO make internal? Since the subgraph will be able to tell what's the first slot.
    *  @param _startPoint The point from which you start looking for a free slot.
    *  @return The first free request slot from the starting point.
    */
-  function firstFreeSlot(uint64 _startPoint) public view returns (uint64) {
+  function firstFreeSlot(uint64 _startPoint) internal view returns (uint64) {
     uint64 i = _startPoint;
     // this is used == true, because if used, slotdata is of shape 1xxx0000, so it's larger than 127
     while (slots[i].slotdata > 127) {
@@ -892,11 +893,10 @@ contract SlotCurate is IArbitrable, IEvidence {
   /** @dev Get the first free dispute slot from a given point.
    *  Relying on this in the frontend could result in collisions.
    *  This view function is used for the frontrun protection request functions.
-   *  TODO make internal? Since the subgraph will be able to tell what's the first slot.
    *  @param _startPoint The point from which you start looking for a free slot.
    *  @return The first free dispute slot from the starting point.
    */
-  function firstFreeDisputeSlot(uint64 _startPoint) public view returns (uint64) {
+  function firstFreeDisputeSlot(uint64 _startPoint) internal view returns (uint64) {
     uint64 i = _startPoint;
     while (disputes[i].state == DisputeState.Used) {
       i++;
@@ -904,22 +904,22 @@ contract SlotCurate is IArbitrable, IEvidence {
     return i;
   }
 
-  /** @dev Check if a slot can be executed. TODO make internal?
+  /** @dev Check if a slot can be executed.
    *  @param _slot The slot to check.
    *  @param _requestPeriod The period the request has to last to be executable.
    *  @return True if the slot can be executed, false otherwise.
    */
-  function slotIsExecutable(Slot memory _slot, uint40 _requestPeriod) public view returns (bool) {
+  function slotIsExecutable(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used && (block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
   }
 
-  /** @dev Check if a slot can be challenged. TODO make internal?
+  /** @dev Check if a slot can be challenged.
    *  @param _slot The slot to check.
    *  @param _requestPeriod The period the request has to last to be executable.
    *  @return True if the slot can be executed, false otherwise.
    */
-  function slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) public view returns (bool) {
+  function slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
     return used && !(block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
   }
