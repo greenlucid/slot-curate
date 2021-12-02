@@ -1,5 +1,6 @@
 /**
- * @authors: @greenlucid
+ * @authors: [@greenlucid]
+ * @title Slot Curate
  * @reviewers: []
  * @auditors: []
  * @bounties: []
@@ -15,32 +16,58 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 /*
     things to think about
 
-    remove this comment when you skim through all the previous comments
-    and write "bugs" that really are deliberate decisions to optimize gas
-    and the workarounds there are around them.
-
-    put the most used functions (add, remove item) as first functions because that
-    makes it cheaper
-    actually:
-    it's not based on order, but on the hash of the function string definition.
-    the function hashes are ordered in some way
-    functions that come last cost extra 22 gas per every function that is checked before
-    there are 32 public funcs, so the one that comes last will cost 31 * 22 = 682 extra gas.
-    so the main function "addItem", assuming is roughly in the middle, costs 341 extra gas.
-    ~0.2 USD at current price
-    if you make it the first function (by naming it addItem4, for example), you save it.
-    this optimization is WIP because gas savings
-    have been lower than expected (~100 gas). TODO look into it
-
     Current TODO
 
+    rename funcs to get addItem higher
+
     why not compress the function arguments? saves ~300 gas per argument...
+
+    should we keep the contributions of losing parties in rounds in which only
+    losing party contributes, burned inside the contract?
+    or have a way to rescue those spoils, somehow?
+
+    you can, when you make a contrib, check if the contrib is enough to launch the appeal
+    instead of launching the appeal separatedly
+    the problem is that this would make contribute() more expensive
+
+    you can use a similar logic to:
+    - if appealCost == 0, call appealCost() and cache it
+    - when the threshold is reached, check external appealCost, if enough, advance to next round.
+    but, where do you store the appealCost?
+    this could be achieved by storing amounts in uint64, for example
+
+    rethinking Dispute logic:
+    if a valid _reason is needed to successfully challenge, then an attacker can use an invalid _reason
+    to make sure the item is added to the list.
+    the work around is to add an event DisputeFail and reset the timestamp of the slot.
+    this allows an attacker to continuously submit invalid Disputes, but it is costly
+    (until some "defender" frontruns the next invalid dispute with a valid Dispute)
+    however, if the item is valid, then it won't be added to the list until attacker stops disputing.
+    but, because it requires continuous expenses for the attacker, it's at least bounded by their resources.
+
+    a defender could go around this by creating pararell requests to make it more expensive for the attacker
+    this will however be costly for the defender, because only one request will be successful.
+
+    changing the slot timestamp will change the evidenceGroupId of the request. keep that in mind.
+
+    this also makes a problem with how removeItem works. it uses a _reason too, which is linked to
+    the original evidenceGroupId. this can be clarified in the removal MetaEvidence, and it can be
+    made to work in the Curate frontend because the evidenceGroupId of every item is stored there.
+
+    yeah, remember that making this change will affect "withdrawRoundZero". it will be a function you
+    can only reward the challenger.
+    and, pendingInitialWithdraw must be set to false if the ruling is in favor of the request.
 */
 
+/**
+ * @title Slot Curate
+ * @author Green
+ * @dev A gas optimized version of Curate, intended to be used with a subgraph.
+ */
 contract SlotCurate is IArbitrable, IEvidence {
   uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
   uint256 internal constant RULING_OPTIONS = 2;
-  uint256 internal constant DIVIDER = 1_000_000;
+  uint256 internal constant DIVIDER = 1_000_000; // this is how you divide in solidity, or multiply by floats
 
   enum ProcessType {
     Add,
@@ -61,7 +88,7 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // settings cannot be mutated once created, otherwise pending processes could get attacked.
   struct Settings {
-    uint80 requesterStake;
+    uint80 requesterStake; // this is realAmount >> AMOUNT_BITSHIFT !!!!
     uint40 requestPeriod;
     uint64 multiplier; // divide by DIVIDER for float.
     uint72 freeSpace;
@@ -74,6 +101,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     // even, if arb doesn't need a lot of data
     // you can just store it in the free space.
     // e.g. KlerosLiquid uses like 32 bits of data max.
+    // but optimizing Settings creation is not important.
   }
 
   struct Slot {
@@ -94,16 +122,16 @@ contract SlotCurate is IArbitrable, IEvidence {
     bool pendingInitialWithdraw;
     uint8 freeSpace;
     uint64 nContributions;
-    uint64[2] pendingWithdraws; // pendingWithdraws[_party]
+    uint64[2] pendingWithdraws; // pendingWithdraws[_party], used to set the disputeSlot free
     uint40 appealDeadline;
     Party winningParty; // for withdrawals, set at rule()
     uint16 freeSpace2;
   }
 
   struct Contribution {
-    uint8 round; // could be bigger. but because exp cost, shouldn't be needed.
+    uint8 round; // could be bigger. but because exp cost on appeal, shouldn't be needed.
     // if you have a bool "firstOfRound" instead.
-    // you could save 1 byte
+    // you could save 1 byte if packed in contribdata
     // but would make withdrawOneContribution O(n) because rewards are distributed
     // round wise
     uint8 contribdata; // compressed form of bool withdrawn, Party party.
@@ -120,13 +148,14 @@ contract SlotCurate is IArbitrable, IEvidence {
   // EVENTS //
 
   event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
-  event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
-  // _requesterStake, _requestPeriod,
+  event ListUpdated(uint64 _listId, uint48 _settingsId, address _governor);
+
   event SettingsCreated(uint80 _requesterStake, uint40 _requestPeriod, uint64 multiplier, bytes _arbitratorExtraData);
   // why emit settingsId in the request events?
   // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
   // the subgraph can check the list at that time and ignore requests with invalid settings.
-  
+  // in an optimistic rollup, however, it will be refactored to store this information,
+
   // every byte costs 8 gas so 80 gas saving by publishing uint176
   event ItemAddRequest(uint176 _addRequestData, string _ipfsUri);
   event ItemRemovalRequest(uint240 _removalRequestData);
@@ -141,23 +170,28 @@ contract SlotCurate is IArbitrable, IEvidence {
   event RequestChallenged(uint64 _slotIndex, uint64 _disputeSlot);
   event FreedDisputeSlot(uint64 _disputeSlot);
 
-
   // CONTRACT STORAGE //
 
+  IArbitrator internal immutable arbitrator; // only one arbitrator per contract. changing arbitrator requires redeployment
+  // redeploying the contract has the issue of the contract needing settings to be the same in the same order
 
-  IArbitrator immutable internal arbitrator;
-  uint48 internal settingsCount; // settings have to be stored, this gives unique, ordered ids, and allows to check
-  // if settings exist.
+  uint48 internal settingsCount; // this gives unique ids, and allows to check if settings exist.
 
   mapping(uint64 => Slot) internal slots;
   mapping(uint64 => DisputeSlot) internal disputes;
   // a spam attack would take ~1M years of full mainnet blocks to deplete settings id space.
   mapping(uint48 => Settings) internal settingsMap;
   mapping(uint64 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
-  // roundContributionsMap[disputeSlot][round][Party]
+  // roundContributionsMap[disputeSlot][round]
   mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
   mapping(uint256 => uint64) internal disputeIdToDisputeSlot; // disputeIdToDisputeSlot[disputeId]
 
+  /** @dev Constructs the SlotCurate contract.
+   *  @param _arbitrator The address of the arbitrator.
+   *  @param _addMetaEvidence The ipfs uri of the addMetaEvidence.
+   *  @param _removalMetaEvidence The ipfs uri of the removalMetaEvidence.
+   *  @param _editMetaEvidence The ipfs uri of the editMetaEvidence.
+   */
   constructor(
     address _arbitrator,
     string memory _addMetaEvidence,
@@ -173,7 +207,11 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // PUBLIC FUNCTIONS
 
-  // list is completely stored in the subgraph, and assigned a listId depending on the amount of lists existing.
+  /** @dev Creates a list that is stored in the subgraph. Its ID will be determined by a counter in the subgraph.
+   *  @param _settingsId The id of the settings this list uses. It's verified in the subgraph.
+   *  @param _governor The address of the list's governor, that's allowed to update the list.
+   *  @param _ipfsUri The ipfs uri of the document detailing the submission requirements for the list.
+   */
   function createList(
     uint48 _settingsId,
     address _governor,
@@ -184,17 +222,30 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit ListCreated(_settingsId, _governor, _ipfsUri);
   }
 
-  // subgraph won't accept the update if the msg.sender is not the _governor of the list
-  // update does NOT allow changing _ipfsUri of the rules of the list, as that would be unfair
-  // if the rules change after unfinished requests are made, or while disputes are taking place.
+  /** @dev Updates a list in the subgraph. Subgraph won't accept the update if the msg.sender is not _governor.
+   *  Update does NOT allow changing _ipfsUri of the rules of the list, as that would be unfair
+   *  if the rules change after unfinished requests are made, or while disputes are taking place.
+   *  @param _listId The id of the list to be updated.
+   *  @param _settingsId The id of the new settings of the list. It's verified to exist in the subgraph.
+   *  @param _newGovernor The address of the new governor of the list.
+   */
   function updateList(
-    uint64 _listIndex,
+    uint64 _listId,
     uint48 _settingsId,
     address _newGovernor
   ) external {
-    emit ListUpdated(_listIndex, _settingsId, _newGovernor);
+    emit ListUpdated(_listId, _settingsId, _newGovernor);
   }
 
+  /** @dev Creates a settings, and stores it in the contract. Settings are immutable.
+   *  @param _requesterStake The stake needed to make any request, be it add, edit or remove.
+   *  It has to be already shifted right by 32 bits.
+   *  @param _requestPeriod The period of time in seconds that the request must stay unchallenged
+   *  To be added to the list.
+   *  @param _multiplier A number used to calculate how much more amount is needed to appeal.
+   *  When submitted, it has to be already multiplied by DIVIDER.
+   *  @param _arbitratorExtraData The arbitratorExtraData used to create disputes.
+   */
   function createSettings(
     uint80 _requesterStake,
     uint40 _requestPeriod,
@@ -220,9 +271,17 @@ contract SlotCurate is IArbitrable, IEvidence {
   // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
   // then item will be ignored or marked as invalid.
 
-  // fix for all requests
+  /** @dev Creates a request to add an item to a list.
+   *  @param _listId The id of the list the item is added to.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _idSlot The id of the slot in which the request will have its lifecycle.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _ipfsUri The ipfs uri of the data of the item to be submitted to the list.
+   */
   function addItem(
-    uint64 _listIndex,
+    uint64 _listId,
     uint48 _settingsId,
     uint64 _idSlot,
     string calldata _ipfsUri
@@ -240,12 +299,20 @@ contract SlotCurate is IArbitrable, IEvidence {
     // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
     // LLLLLLLLSSSSSSIIIIIIII
     // move list 14, move settings 8, add idSlot.
-    emit ItemAddRequest(((_listIndex << 14) + (_settingsId << 8) + _idSlot), _ipfsUri);
+    emit ItemAddRequest(((_listId << 14) + (_settingsId << 8) + _idSlot), _ipfsUri);
   }
 
-  // frontrunning protection
+  /** @dev Equivalent to addItem, but with frontrun protection.
+   *  @param _listId The id of the list the item is added to.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _fromSlot The id of the slot to start iterating from.
+   *  The function will create the request in the first available slot it finds.
+   *  @param _ipfsUri The ipfs uri of the data of the item to be submitted to the list.
+   */
   function addItemInFirstFreeSlot(
-    uint64 _listIndex,
+    uint64 _listId,
     uint48 _settingsId,
     uint64 _fromSlot,
     string calldata _ipfsUri
@@ -262,9 +329,21 @@ contract SlotCurate is IArbitrable, IEvidence {
     // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
     // LLLLLLLLSSSSSSIIIIIIII
     // move list 14, move settings 8, add idSlot.
-    emit ItemAddRequest(((_listIndex << 14) + (_settingsId << 8) + workSlot), _ipfsUri);
+    emit ItemAddRequest(((_listId << 14) + (_settingsId << 8) + workSlot), _ipfsUri);
   }
 
+  /** @dev Creates a request to remove an item from a list.
+   *  @param _workSlot The slot in which the request will be processed.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is removed from.
+   *  @param _itemId The id of the item to be removed from the list.
+   *  @param _reason The ipfs uri of the reason to remove the item from the list.
+   *  If incorrect, even if the item does not belong to the list for any other reason,
+   *  It should be disputed as a failed request.
+   */
   function removeItem(
     uint64 _workSlot,
     uint48 _settingsId,
@@ -287,10 +366,22 @@ contract SlotCurate is IArbitrable, IEvidence {
     // move list 14, move settings 8, add idSlot.
     emit ItemRemovalRequest((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
     // the evidenceGroupId is the one of this one request.
-    uint evidenceGroupId = uint(keccak256(abi.encodePacked(_workSlot, uint40(block.timestamp))));
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_workSlot, uint40(block.timestamp))));
     emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
+  /** @dev Equivalent to removeItem, but with frontrun protection.
+   *  @param _fromSlot The id of the slot to start iterating from.
+   *  The function will create the request in the first available slot it finds.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is removed from.
+   *  @param _itemId The id of the item to be removed from the list.
+   *  @param _reason The ipfs uri of the reason to remove the item from the list.
+   *  If incorrect, even if the item does not belong to the list for any other reason,
+   *  It should be disputed as a failed request.
+   */
   function removeItemInFirstFreeSlot(
     uint64 _fromSlot,
     uint48 _settingsId,
@@ -312,10 +403,22 @@ contract SlotCurate is IArbitrable, IEvidence {
     // move list 14, move settings 8, add idSlot.
     emit ItemRemovalRequest((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
     // the evidenceGroupId is the one of this one request.
-    uint evidenceGroupId = uint(keccak256(abi.encodePacked(workSlot, uint40(block.timestamp))));
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(workSlot, uint40(block.timestamp))));
     emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
+  /** @dev Creates a request to edit an item in a list.
+   *  @param _workSlot The slot in which the request will be processed.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is edited in.
+   *  @param _itemId The id of the item to be edited in the list.
+   *  @param _ipfsUri The ipfs uri that links to the new data for the item.
+   *  It will replace the previous data completely, but the item will maintain
+   *  the same id inside the list.
+   */
   function editItem(
     uint64 _workSlot,
     uint48 _settingsId,
@@ -339,6 +442,18 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit ItemEditRequest(((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
   }
 
+  /** @dev Creates a request to edit an item in a list.
+   *  @param _fromSlot The id of the slot to start iterating from.
+   *  The function will create the request in the first available slot it finds.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is edited in.
+   *  @param _itemId The id of the item to be edited in the list.
+   *  @param _ipfsUri The ipfs uri that links to the new data for the item.
+   *  It will replace the previous data completely, but the item will maintain
+   *  the same id inside the list.
+   */
   function editItemInFirstFreeSlot(
     uint64 _fromSlot,
     uint48 _settingsId,
@@ -361,6 +476,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit ItemEditRequest(((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
   }
 
+  /** @dev Accept a request that is over the requestPeriod and undisputed.
+   *  @param _slotIndex The id of the slot containing the request to be accepted.
+   */
   function executeRequest(uint64 _slotIndex) external {
     Slot storage slot = slots[_slotIndex];
     Settings storage settings = settingsMap[slot.settingsId];
@@ -372,7 +490,19 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.slotdata = 0;
   }
 
-  function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot, string calldata _reason) public payable {
+  /** @dev Challenge a request that is not over the requestPeriod.
+   *  @param _slotIndex The id of the slot containing the request to challenge.
+   *  @param _disputeSlot The id of the disputeSlot in which the dispute data will be stored.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _reason The ipfs uri linking to a file describing the reason the request
+   *  must be rejected. If the request is incorrect, but not for the reason the challenger
+   *  is giving, then the dispute should fail.
+   */
+  function challengeRequest(
+    uint64 _slotIndex,
+    uint64 _disputeSlot,
+    string calldata _reason
+  ) public payable {
     Slot storage slot = slots[_slotIndex];
     Settings storage settings = settingsMap[slot.settingsId];
     require(slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
@@ -416,39 +546,64 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit RequestChallenged(_slotIndex, _disputeSlot);
     // ERC 1497
     // the evidenceGroupId is obtained from the slot of the challenged request
-    uint evidenceGroupId = uint(keccak256(abi.encodePacked(_slotIndex, slot.requestTime)));
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_slotIndex, slot.requestTime)));
     // metaEvidenceId is related to the processType (different for Add, Removal or Edit)
-    emit Dispute(arbitrator, arbitratorDisputeId, uint(processType), evidenceGroupId);
+    emit Dispute(arbitrator, arbitratorDisputeId, uint256(processType), evidenceGroupId);
     emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
-  function challengeRequestInFirstFreeSlot(uint64 _slotIndex, uint64 _fromSlot, string calldata _reason) public payable {
+  /** @dev Like challengeRequest but with frontrun protection.
+   *  @param _slotIndex The id of the slot containing the request to challenge.
+   *  @param _fromSlot The id of the disputeSlot that will checked first for availability.
+   *  It will create a dispute in the first available disputeSlot.
+   *  @param _reason The ipfs uri linking to a file describing the reason the request
+   *  must be rejected. If the request is incorrect, but not for the reason the challenger
+   *  is giving, then the dispute should fail.
+   */
+  function challengeRequestInFirstFreeSlot(
+    uint64 _slotIndex,
+    uint64 _fromSlot,
+    string calldata _reason
+  ) public payable {
     uint64 disputeWorkSlot = firstFreeDisputeSlot(_fromSlot);
     challengeRequest(_slotIndex, disputeWorkSlot, _reason);
   }
 
-  function submitEvidence(uint _evidenceGroupId, string calldata _evidence) external {
+  /** @dev Submit Evidence to any evidenceGroupId
+   *  @param _evidenceGroupId The evidenceGroupId the Evidence is submitted to.
+   *  @param _evidence The ipfs uri linking to the file that contains the evidence.
+   */
+  function submitEvidence(uint256 _evidenceGroupId, string calldata _evidence) external {
     // you can just submit evidence directly to any _evidenceGroupId
     emit Evidence(arbitrator, _evidenceGroupId, msg.sender, _evidence);
   }
 
+  /** @dev Make a contribution towards the appeal of a dispute.
+   *  @param _disputeSlot The disputeSlot linked to the dispute the contribution is intended for.
+   *  @param _party The party this contribution is siding with. This will decide if this
+   *  contribution has a reward or not after the dispute is over.
+   */
   function contribute(uint64 _disputeSlot, Party _party) public payable {
     DisputeSlot storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Used, "DisputeSlot has to be used");
 
     _verifyUnderAppealDeadline(dispute);
 
-    uint8 nextRound = dispute.currentRound + 1;
-    // pendingWithdrawal = true, party = _party
-    uint8 contribdata = paramsToContribdata(true, _party);
     dispute.nContributions++;
-    dispute.pendingWithdraws[uint(_party)]++;
+    dispute.pendingWithdraws[uint256(_party)]++;
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
     uint80 amount = compressAmount(msg.value);
+    uint8 nextRound = dispute.currentRound + 1;
     roundContributionsMap[_disputeSlot][nextRound].partyTotal[uint256(_party)] += amount;
+
+    // pendingWithdrawal = true, party = _party
+    uint8 contribdata = paramsToContribdata(true, _party);
     contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: nextRound, contribdata: contribdata, contributor: msg.sender, amount: amount});
   }
 
+  /** @dev Appeal a dispute and start the next round. It will use the contributed funds.
+   *  @param _disputeSlot The disputeSlot linked to the dispute to be appealed.
+   */
   function startNextRound(uint64 _disputeSlot) public {
     DisputeSlot storage dispute = disputes[_disputeSlot];
     uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
@@ -484,6 +639,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     // arbitrator will surely do it for you
   }
 
+  /** @dev Give a ruling for a dispute. Can only be called by the arbitrator. TRUSTED.
+   *  @param _disputeId The arbitrator id of the dispute.
+   *  @param _ruling The ruling for the dispute.
+   */
   function rule(uint256 _disputeId, uint256 _ruling) external override {
     // arbitrator is trusted to:
     // a. call this only once, after dispute is final
@@ -514,6 +673,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit Ruling(arbitrator, _disputeId, _ruling);
   }
 
+  /** @dev Withdraw a single contribution from an appeal, if elegible for a reward.
+   * @param _disputeSlot The disputeSlot the contribution was made for.
+   * @param _contributionSlot The slot in which the contribution was stored.
+   */
   function withdrawOneContribution(uint64 _disputeSlot, uint64 _contributionSlot) public {
     // check if dispute is used.
     DisputeSlot storage dispute = disputes[_disputeSlot];
@@ -543,13 +706,13 @@ contract SlotCurate is IArbitrable, IEvidence {
       payable(contribution.contributor).transfer(refund);
     }
 
-    if (dispute.pendingWithdraws[uint(winningParty)] == 1 && !dispute.pendingInitialWithdraw) {
+    if (dispute.pendingWithdraws[uint256(winningParty)] == 1 && !dispute.pendingInitialWithdraw) {
       // this was last contrib remaining
       // no need to decrement pendingWithdraws if last. saves gas.
       dispute.state = DisputeState.Free;
       emit FreedDisputeSlot(_disputeSlot);
     } else {
-      dispute.pendingWithdraws[uint(winningParty)]--;
+      dispute.pendingWithdraws[uint256(winningParty)]--;
       // set contribution as withdrawn. party doesn't matter, so it's chosen as Party.Requester
       // (pendingWithdrawal = false, party = Party.Requester) => paramsToContribution(false, Party.Requester) = 0
       contribution.contribdata = 0;
@@ -557,6 +720,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
   }
 
+  /** @dev Withdraw the initial stake.
+  This has to be changed to only withdraw to the challenger.
+  TODO
+   *  @param _disputeSlot The disputeSlot to withdraw the initial stake from.
+   */
   function withdrawRoundZero(uint64 _disputeSlot) public {
     // "round zero" refers to the initial requester stake
     // it's not stored like the other contributions.
@@ -565,7 +733,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Settings storage settings = settingsMap[slot.settingsId];
 
     require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
-    
+
     require(dispute.pendingInitialWithdraw, "Round zero was already withdrawn");
 
     // withdraw it. this can be put onto its own private func.
@@ -573,7 +741,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     Party winningParty = dispute.winningParty;
     _withdrawRoundZero(dispute, settings, slot, winningParty);
 
-    if (dispute.pendingWithdraws[uint(winningParty)] == 0) {
+    if (dispute.pendingWithdraws[uint256(winningParty)] == 0) {
       dispute.state = DisputeState.Free;
       emit FreedDisputeSlot(_disputeSlot);
     } else {
@@ -581,6 +749,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
   }
 
+  /** @dev Withdraws all contributions and the initial stake, and sets the disputeSlot Free.
+   *  @param _disputeSlot The target disputeSlot.
+   */
   function withdrawAllContributions(uint64 _disputeSlot) public {
     // this func is a "public good". it uses less gas overall to withdraw all
     // contribs. because you only need to change 1 single flag.
@@ -595,7 +766,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     // withdrawAllRewards does not set the flag on "withdrawn" individually.
     // that's why you check for dispute as well.
     require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
-    
+
     Party winningParty = dispute.winningParty;
     uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
     // this is a separate func to make it more efficient.
@@ -637,7 +808,11 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // PRIVATE FUNCTIONS
 
-  // can mutate storage. reverts if not under appealDeadline
+  /** @dev Called when dispute.appealDeadline is over block.timestamp.
+   *  Will check arbitrator deadline, and revert if period is over.
+   *  This is to read it from storage instead of calling an external function.
+   *  @param _dispute The dispute that is verified.
+   */
   function _verifyUnderAppealDeadline(DisputeSlot storage _dispute) private {
     if (block.timestamp >= _dispute.appealDeadline) {
       // you're over it. get updated appealPeriod
@@ -647,6 +822,13 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
   }
 
+  /** @dev Withdraws the initial stake to the winner.
+   *  TODO change it so that only challenger receives the withdrawal.
+   *  @param _dispute The dispute whose initial stake is withdrawn, to read challenger.
+   *  @param _settings The settings linked to the dispute, to read the stake.
+   *  @param _slot The slot containing the request, to read requester. TODO remove.
+   *  @param _party The party that will receive the reward, TODO remove.
+   */
   function _withdrawRoundZero(
     DisputeSlot storage _dispute,
     Settings storage _settings,
@@ -662,6 +844,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
   }
 
+  /** @dev Withdraws a contribution as a reward.
+   *  @param _contribution The contribution to be withdrawn.
+   *  @param _roundContributions The contributions of the round to figure out the reward.
+   *  @param _winningParty The party that won the dispute.
+   */
   function _withdrawSingleReward(
     Contribution memory _contribution,
     RoundContributions memory _roundContributions,
@@ -674,6 +861,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     payable(_contribution.contributor).transfer(share);
   }
 
+  /** @dev Refunds a contribution when the round for that contribution wasn't appealed.
+   *  @param _contribution The contribution to refund.
+   */
   function _refundContribution(Contribution memory _contribution) private {
     uint256 refund = decompressAmount(_contribution.amount);
     // should use send instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
@@ -683,10 +873,13 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // VIEW FUNCTIONS
 
-  // relying on this by itself could result on users colliding on same slot
-  // user which is late will have the transaction cancelled, but gas wasted and unhappy ux
-  // could be used to make an "emergency slot", in case your slot submission was in an used slot.
-  // will get the first Virgin, or Created slot.
+  /** @dev Get the first free request slot from a given point.
+   *  Relying on this in the frontend could result in collisions.
+   *  This view function is used for the frontrun protection request functions.
+   *  TODO make internal? Since the subgraph will be able to tell what's the first slot.
+   *  @param _startPoint The point from which you start looking for a free slot.
+   *  @return The first free request slot from the starting point.
+   */
   function firstFreeSlot(uint64 _startPoint) public view returns (uint64) {
     uint64 i = _startPoint;
     // this is used == true, because if used, slotdata is of shape 1xxx0000, so it's larger than 127
@@ -696,6 +889,13 @@ contract SlotCurate is IArbitrable, IEvidence {
     return i;
   }
 
+  /** @dev Get the first free dispute slot from a given point.
+   *  Relying on this in the frontend could result in collisions.
+   *  This view function is used for the frontrun protection request functions.
+   *  TODO make internal? Since the subgraph will be able to tell what's the first slot.
+   *  @param _startPoint The point from which you start looking for a free slot.
+   *  @return The first free dispute slot from the starting point.
+   */
   function firstFreeDisputeSlot(uint64 _startPoint) public view returns (uint64) {
     uint64 i = _startPoint;
     while (disputes[i].state == DisputeState.Used) {
@@ -704,23 +904,43 @@ contract SlotCurate is IArbitrable, IEvidence {
     return i;
   }
 
-  function slotIsExecutable(Slot memory _slot, uint40 requestPeriod) public view returns (bool) {
+  /** @dev Check if a slot can be executed. TODO make internal?
+   *  @param _slot The slot to check.
+   *  @param _requestPeriod The period the request has to last to be executable.
+   *  @return True if the slot can be executed, false otherwise.
+   */
+  function slotIsExecutable(Slot memory _slot, uint40 _requestPeriod) public view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
-    return used && (block.timestamp > _slot.requestTime + requestPeriod) && !disputed;
+    return used && (block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
   }
 
-  function slotCanBeChallenged(Slot memory _slot, uint40 requestPeriod) public view returns (bool) {
+  /** @dev Check if a slot can be challenged. TODO make internal?
+   *  @param _slot The slot to check.
+   *  @param _requestPeriod The period the request has to last to be executable.
+   *  @return True if the slot can be executed, false otherwise.
+   */
+  function slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) public view returns (bool) {
     (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
-    return used && !(block.timestamp > _slot.requestTime + requestPeriod) && !disputed;
+    return used && !(block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
   }
 
-  function challengeFee(uint64 _slotIndex) public view returns (uint256 arbitrationFee) {
-    Slot storage slot = slots[_slotIndex];
+  /** @dev Check the challenge fee a challenger would incur if challenging a request.
+   *  @param _slotId The id of the slot.
+   *  @return The arbitration fee to challenge a request.
+   */
+  function challengeFee(uint64 _slotId) public view returns (uint256) {
+    Slot storage slot = slots[_slotId];
     Settings storage settings = settingsMap[slot.settingsId];
 
-    arbitrationFee = arbitrator.arbitrationCost(settings.arbitratorExtraData);
+    return (arbitrator.arbitrationCost(settings.arbitratorExtraData));
   }
 
+  /** @dev Compress slot request variables for storage.
+   *  @param _used The usage status of the slot.
+   *  @param _disputed The disputed status of the slot.
+   *  @param _processType The type of request contained in the slot (add, removal, edit)
+   *  @return The compressed data.
+   */
   function paramsToSlotdata(
     bool _used,
     bool _disputed, // you store disputed to stop someone from calling executeRequest
@@ -737,6 +957,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     return slotdata;
   }
 
+  /** @dev Decompress slotdata to its variables.
+   *  @param _slotdata The slotdata to decompress.
+   *  @return (used, disputed, processType), the decompressed variables of the slotdata.
+   */
   function slotdataToParams(uint8 _slotdata)
     internal
     pure
@@ -757,6 +981,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     return (used, disputed, processType);
   }
 
+  /** @dev Compress contribution variables for storage.
+   *  @param _pendingWithdrawal The status of withdrawal of the contribution.
+   *  @param _party The party supported by the contribution.
+   *  @return The compressed data.
+   */
   function paramsToContribdata(bool _pendingWithdrawal, Party _party) internal pure returns (uint8) {
     uint8 pendingWithdrawalAddend;
     if (_pendingWithdrawal) pendingWithdrawalAddend = 128;
@@ -767,6 +996,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     return contribdata;
   }
 
+  /** @dev Decompress contribdata to its variables.
+   *  @param _contribdata The contribdata to decompress.
+   *  @return (pendingWithdrawal, party), the decompressed variables of the contribdata.
+   */
   function contribdataToParams(uint8 _contribdata) internal pure returns (bool, Party) {
     uint8 pendingWithdrawalAddend = _contribdata & 128;
     bool pendingWithdrawal = pendingWithdrawalAddend != 0;
@@ -777,10 +1010,18 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   // always compress / decompress rounding down.
+  /** @dev Compress an amount by shifting its bits to the right.
+   *  @param _amount The uint256 version of the amount.
+   *  @return The uint80 compressed version of the amount.
+   */
   function compressAmount(uint256 _amount) internal pure returns (uint80) {
     return (uint80(_amount >> AMOUNT_BITSHIFT));
   }
 
+  /** @dev Decompress an amount by shifting its bits to the left
+   *  @param _compressedAmount The uint80 compressed version of the amount.
+   *  @return The uint256 version of the amount, losing its 32 less significant bits, up to 4 gwei.
+   */
   function decompressAmount(uint80 _compressedAmount) internal pure returns (uint256) {
     return (uint256(_compressedAmount) << AMOUNT_BITSHIFT);
   }
