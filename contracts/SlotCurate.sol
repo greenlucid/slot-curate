@@ -1,6 +1,5 @@
 /**
  * @authors: [@greenlucid]
- * @title Slot Curate
  * @reviewers: []
  * @auditors: []
  * @bounties: []
@@ -35,11 +34,6 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     - when the threshold is reached, check external appealCost, if enough, advance to next round.
     but, where do you store the appealCost?
     this could be achieved by storing amounts in uint64, for example
-
-    TODO prepend internal view funcs with _
-
-    make an event to signal the creation of a new round? or can the subgraph listen to arbitrator
-    and get this information that way? this doesn't have to be optimized at all.
 */
 
 /**
@@ -75,16 +69,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint40 requestPeriod;
     uint64 multiplier; // divide by DIVIDER for float.
     uint72 freeSpace;
-    bytes arbitratorExtraData; // since you're deploying with a known arbitrator
-    // you can hardcode the size of the arbitratorExtraData and save 1 storage slot
-    // like, bytes32[2] arbitratorExtraData
-    // just transform it when needed.
-    // should be cheaper to interact with since you don't have to storage read the length
-    // (because "bytes" stores length too)
-    // even, if arb doesn't need a lot of data
-    // you can just store it in the free space.
-    // e.g. KlerosLiquid uses like 32 bits of data max.
-    // but optimizing Settings creation is not important.
+    bytes arbitratorExtraData;
   }
 
   struct Slot {
@@ -112,10 +97,6 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   struct Contribution {
     uint8 round; // could be bigger. but because exp cost on appeal, shouldn't be needed.
-    // if you have a bool "firstOfRound" instead.
-    // you could save 1 byte if packed in contribdata
-    // but would make withdrawOneContribution O(n) because rewards are distributed
-    // round wise
     uint8 contribdata; // compressed form of bool withdrawn, Party party.
     uint80 amount; // to be raised 32 bits.
     address contributor; // could be compressed to 64 bits, but there's no point.
@@ -257,14 +238,13 @@ contract SlotCurate is IArbitrable, IEvidence {
     emit SettingsCreated(_requesterStake, _requestPeriod, _multiplier, _arbitratorExtraData);
   }
 
-  // no refunds for overpaying. consider it burned. refunds are bloat.
-
-  // in the contract, listIndex and settingsId are trusted.
-  // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
-  // then item will be ignored or marked as invalid.
+  // None of the requests have refunds for overpaying. Consider the excess burned.
+  // It is expected of the frontend to make the transaction with the
+  // least significant bits set to zero in amount, to protect caller from losing those 4 gwei.
 
   /** @dev Creates a request to add an item to a list.
    *  @param _listId The id of the list the item is added to.
+   *  If the list doesn't exist, the subgraph will ignore the request.
    *  @param _settingsId The trusted settings belonging to that list.
    *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
    *  and will ignore the request if the settings are not correct.
@@ -290,12 +270,12 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.settingsId = _settingsId;
     // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
     // LLLLLLLLSSSSSSIIIIIIII
-    // move list 14, move settings 8, add idSlot.
     emit ItemAddRequest(((_listId << 14) + (_settingsId << 8) + _idSlot), _ipfsUri);
   }
 
   /** @dev Equivalent to addItem, but with frontrun protection.
    *  @param _listId The id of the list the item is added to.
+   *  If the list doesn't exist, the subgraph will ignore the request.
    *  @param _settingsId The trusted settings belonging to that list.
    *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
    *  and will ignore the request if the settings are not correct.
@@ -320,7 +300,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.settingsId = _settingsId;
     // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
     // LLLLLLLLSSSSSSIIIIIIII
-    // move list 14, move settings 8, add idSlot.
     emit ItemAddRequest(((_listId << 14) + (_settingsId << 8) + workSlot), _ipfsUri);
   }
 
@@ -331,6 +310,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
    *  and will ignore the request if the settings are not correct.
    *  @param _listId The id of the list the item is removed from.
+   *  If the list doesn't exist, the subgraph will ignore the request.
    *  @param _itemId The id of the item to be removed from the list.
    *  @param _reason The ipfs uri of the reason to remove the item from the list.
    *  If incorrect, even if the item does not belong to the list for any other reason,
@@ -355,7 +335,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.settingsId = _settingsId;
     // format of uint240 removeRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
     // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
-    // move list 14, move settings 8, add idSlot.
     emit ItemRemovalRequest((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
     // the evidenceGroupId is the one of this one request.
     uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_workSlot, uint40(block.timestamp))));
@@ -369,6 +348,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
    *  and will ignore the request if the settings are not correct.
    *  @param _listId The id of the list the item is removed from.
+   *  If the list doesn't exist, the subgraph will ignore the request.
    *  @param _itemId The id of the item to be removed from the list.
    *  @param _reason The ipfs uri of the reason to remove the item from the list.
    *  If incorrect, even if the item does not belong to the list for any other reason,
@@ -392,7 +372,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.settingsId = _settingsId;
     // format of uint240 removeRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
     // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
-    // move list 14, move settings 8, add idSlot.
     emit ItemRemovalRequest((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
     // the evidenceGroupId is the one of this one request.
     uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(workSlot, uint40(block.timestamp))));
@@ -406,6 +385,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
    *  and will ignore the request if the settings are not correct.
    *  @param _listId The id of the list the item is edited in.
+   *  If the list doesn't exist, the subgraph will ignore the request.
    *  @param _itemId The id of the item to be edited in the list.
    *  @param _ipfsUri The ipfs uri that links to the new data for the item.
    *  It will replace the previous data completely, but the item will maintain
@@ -430,7 +410,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.settingsId = _settingsId;
     // format of uint240 editRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
     // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
-    // move list 14, move settings 8, add idSlot.
     emit ItemEditRequest(((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
   }
 
@@ -441,6 +420,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
    *  and will ignore the request if the settings are not correct.
    *  @param _listId The id of the list the item is edited in.
+   *  If the list doesn't exist, the subgraph will ignore the request.
    *  @param _itemId The id of the item to be edited in the list.
    *  @param _ipfsUri The ipfs uri that links to the new data for the item.
    *  It will replace the previous data completely, but the item will maintain
@@ -464,7 +444,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     slot.settingsId = _settingsId;
     // format of uint240 editRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
     // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
-    // move list 14, move settings 8, add idSlot.
     emit ItemEditRequest(((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
   }
 
@@ -661,7 +640,6 @@ contract SlotCurate is IArbitrable, IEvidence {
       (, , ProcessType processType) = _slotdataToParams(slot.slotdata);
       // used: true, disputed: false, ProcessType: processType
       slot.slotdata = _paramsToSlotdata(true, false, processType);
-
     } else {
       // challenger won. emit disputeslot to update the status to Withdrawing in the subgraph
       emit RequestRejected(dispute.slotId, disputeSlot);
@@ -673,11 +651,7 @@ contract SlotCurate is IArbitrable, IEvidence {
       // now, award the requesterStake to challenger
       Settings storage settings = settingsMap[slot.settingsId];
       uint256 amount = _decompressAmount(settings.requesterStake);
-      // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
-      // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
-      // it would break withdrawAllContributions as currently designed,
-      // and for single withdraws, then sending the ether will have to be the very last thing that occurs
-      // after all the flags have been modified.
+      // is it dangerous to send before the end of the function? please answer on audit
       payable(dispute.challenger).send(amount);
     }
 
@@ -737,20 +711,15 @@ contract SlotCurate is IArbitrable, IEvidence {
    */
   function withdrawAllContributions(uint64 _disputeSlot) public {
     // this func is a "public good". it uses less gas overall to withdraw all
-    // contribs. because you only need to change 1 single flag.
-    // it also frees the dispute slot.
-    // if frequent users set up a multisig, or some way to call it,
-    // it would be cheaper in the long run.
+    // contribs. because you only need to change 1 single flag to free the dispute slot.
 
-    // check if dispute is used.
     DisputeSlot storage dispute = disputes[_disputeSlot];
-    // withdrawAllRewards does not set the flag on "withdrawn" individually.
-    // that's why you check for dispute as well.
     require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
 
     Party winningParty = dispute.winningParty;
+    // this is due to how contribdata is encoded. the variable name is self-explanatory.
     uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
-    // this is a separate func to make it more efficient.
+
     // there are two types of contribs that are handled differently:
     // 1. the contributions of appealed rounds.
     uint64 contribSlot = 0;
@@ -758,11 +727,13 @@ contract SlotCurate is IArbitrable, IEvidence {
     RoundContributions memory roundContributions = roundContributionsMap[_disputeSlot][currentRound];
     while (contribSlot < dispute.nContributions) {
       Contribution memory contribution = contributions[_disputeSlot][contribSlot];
+      // update the round
       if (contribution.round != currentRound) {
         roundContributions = roundContributionsMap[_disputeSlot][contribution.round];
         currentRound = contribution.round;
       }
-      if (currentRound > dispute.currentRound) break;
+
+      if (currentRound > dispute.currentRound) break; // see next loop.
 
       if (contribution.contribdata == pendingAndWinnerContribdata) {
         _withdrawSingleReward(contribution, roundContributions, winningParty);
@@ -854,7 +825,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     DisputeSlot memory disputeSlot = disputes[_disputeSlot];
     Slot memory slot = slots[disputeSlot.slotId];
     Settings memory settings = settingsMap[slot.settingsId];
-    return(arbitrator.appealCost(disputeSlot.arbitratorDisputeId, settings.arbitratorExtraData));
+    return (arbitrator.appealCost(disputeSlot.arbitratorDisputeId, settings.arbitratorExtraData));
   }
 
   /** @dev Get the appeal period of making an appeal for a dispute.
@@ -863,7 +834,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    */
   function appealPeriod(uint64 _disputeSlot) public view returns (uint256, uint256) {
     DisputeSlot memory disputeSlot = disputes[_disputeSlot];
-    return(arbitrator.appealPeriod(disputeSlot.arbitratorDisputeId));
+    return (arbitrator.appealPeriod(disputeSlot.arbitratorDisputeId));
   }
 
   // From here, all view functions are internal.
