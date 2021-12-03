@@ -36,29 +36,13 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
     but, where do you store the appealCost?
     this could be achieved by storing amounts in uint64, for example
 
-    rethinking Dispute logic:
-    if a valid _reason is needed to successfully challenge, then an attacker can use an invalid _reason
-    to make sure the item is added to the list.
-    the work around is to add an event DisputeFail and reset the timestamp of the slot.
-    this allows an attacker to continuously submit invalid Disputes, but it is costly
-    (until some "defender" frontruns the next invalid dispute with a valid Dispute)
-    however, if the item is valid, then it won't be added to the list until attacker stops disputing.
-    but, because it requires continuous expenses for the attacker, it's at least bounded by their resources.
-
-    a defender could go around this by creating pararell requests to make it more expensive for the attacker
-    this will however be costly for the defender, because only one request will be successful.
-
-    changing the slot timestamp will change the evidenceGroupId of the request. keep that in mind.
-
-    this also makes a problem with how removeItem works. it uses a _reason too, which is linked to
-    the original evidenceGroupId. this can be clarified in the removal MetaEvidence, and it can be
-    made to work in the Curate frontend because the evidenceGroupId of every item is stored there.
-
-    yeah, remember that making this change will affect "withdrawRoundZero". it will be a function you
-    can only reward the challenger.
-    and, pendingInitialWithdraw must be set to false if the ruling is in favor of the request.
-
     TODO prepend internal view funcs with _
+
+    Some thoughts, having events for contributions would allow to check
+    what the cost of withdrawing all contributions is, so that user can
+    set the proper gas limit.
+    Also, would allow user to check all their contributions, if there
+    were many by the same address... it should be important.
 */
 
 /**
@@ -163,14 +147,14 @@ contract SlotCurate is IArbitrable, IEvidence {
   event ItemRemovalRequest(uint240 _removalRequestData);
   event ItemEditRequest(uint240 _editRequestData, string _ipfsUri);
   // you don't need different events for accept / reject because subgraph remembers the progress per slot.
-  event RequestAccepted(uint64 _slotIndex);
-  event RequestRejected(uint64 _slotIndex);
+  event RequestAccepted(uint64 _slotId); // when request is executed after requestPeriod
 
-  // how to tell if DisputeSlot is now used? You need to emit an event here
-  // because the Challenge event in Arbitrator only knows about external disputeId
-  // these events allow the subgraph to know the status of DisputeSlots
-  event RequestChallenged(uint64 _slotIndex, uint64 _disputeSlot);
-  event FreedDisputeSlot(uint64 _disputeSlot);
+  event RequestChallenged(uint64 _slotId, uint64 _disputeSlot);
+  // both events below signal that the Dispute is in Withdrawing state.
+  event RequestRejected(uint64 _slotId, uint64 _disputeSlot); // when dispute rules to reject the request
+  event DisputeFailed(uint64 _disputeSlot); // signals that the request has its request period reset.
+
+  event FreedDisputeSlot(uint64 _disputeSlot); // called when dispute has no withdraws remaining
 
   // CONTRACT STORAGE //
 
@@ -479,21 +463,21 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   /** @dev Accept a request that is over the requestPeriod and undisputed.
-   *  @param _slotIndex The id of the slot containing the request to be accepted.
+   *  @param _slotId The id of the slot containing the request to be accepted.
    */
-  function executeRequest(uint64 _slotIndex) external {
-    Slot storage slot = slots[_slotIndex];
+  function executeRequest(uint64 _slotId) external {
+    Slot storage slot = slots[_slotId];
     Settings storage settings = settingsMap[slot.settingsId];
     require(slotIsExecutable(slot, settings.requestPeriod), "Slot cannot be executed");
     payable(slot.requester).transfer(settings.requesterStake);
-    emit RequestAccepted(_slotIndex);
+    emit RequestAccepted(_slotId);
     // used to false, others don't matter.
     // paramsToSlotdata(false, false, ProcessType.Add) = 0
     slot.slotdata = 0;
   }
 
   /** @dev Challenge a request that is not over the requestPeriod.
-   *  @param _slotIndex The id of the slot containing the request to challenge.
+   *  @param _slotId The id of the slot containing the request to challenge.
    *  @param _disputeSlot The id of the disputeSlot in which the dispute data will be stored.
    *  This can be frontrun, so there's an equivalent function with frontrun protection.
    *  @param _reason The ipfs uri linking to a file describing the reason the request
@@ -501,11 +485,11 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  is giving, then the dispute should fail.
    */
   function challengeRequest(
-    uint64 _slotIndex,
+    uint64 _slotId,
     uint64 _disputeSlot,
     string calldata _reason
   ) public payable {
-    Slot storage slot = slots[_slotIndex];
+    Slot storage slot = slots[_slotId];
     Settings storage settings = settingsMap[slot.settingsId];
     require(slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
 
@@ -524,11 +508,12 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     slot.slotdata = newSlotdata;
     dispute.arbitratorDisputeId = arbitratorDisputeId;
-    dispute.slotId = _slotIndex;
+    dispute.slotId = _slotId;
     dispute.challenger = msg.sender;
     dispute.state = DisputeState.Used;
     dispute.currentRound = 0;
-    dispute.pendingInitialWithdraw = true;
+    // will be set to true if challenger wins.
+    dispute.pendingInitialWithdraw = false;
     dispute.nContributions = 0;
     dispute.pendingWithdraws[0] = 0;
     dispute.pendingWithdraws[1] = 0;
@@ -545,17 +530,17 @@ contract SlotCurate is IArbitrable, IEvidence {
     roundContributions.partyTotal[0] = 0;
     roundContributions.partyTotal[1] = 0;
 
-    emit RequestChallenged(_slotIndex, _disputeSlot);
+    emit RequestChallenged(_slotId, _disputeSlot);
     // ERC 1497
     // the evidenceGroupId is obtained from the slot of the challenged request
-    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_slotIndex, slot.requestTime)));
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_slotId, slot.requestTime)));
     // metaEvidenceId is related to the processType (different for Add, Removal or Edit)
     emit Dispute(arbitrator, arbitratorDisputeId, uint256(processType), evidenceGroupId);
     emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
   }
 
   /** @dev Like challengeRequest but with frontrun protection.
-   *  @param _slotIndex The id of the slot containing the request to challenge.
+   *  @param _slotId The id of the slot containing the request to challenge.
    *  @param _fromSlot The id of the disputeSlot that will checked first for availability.
    *  It will create a dispute in the first available disputeSlot.
    *  @param _reason The ipfs uri linking to a file describing the reason the request
@@ -563,12 +548,12 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  is giving, then the dispute should fail.
    */
   function challengeRequestInFirstFreeSlot(
-    uint64 _slotIndex,
+    uint64 _slotId,
     uint64 _fromSlot,
     string calldata _reason
   ) public payable {
     uint64 disputeWorkSlot = firstFreeDisputeSlot(_fromSlot);
-    challengeRequest(_slotIndex, disputeWorkSlot, _reason);
+    challengeRequest(_slotId, disputeWorkSlot, _reason);
   }
 
   /** @dev Submit Evidence to any evidenceGroupId
@@ -661,16 +646,25 @@ contract SlotCurate is IArbitrable, IEvidence {
     // 0 refuse, 1 requester, 2 challenger.
     if (_ruling == 1 || _ruling == 0) {
       // requester won.
-      emit RequestAccepted(dispute.slotId);
+      emit DisputeFailed(disputeSlot);
       dispute.winningParty = Party.Requester;
+      // dispute.pendingInitialWithdraw stays at false, because challenger lost.
+      // 5a. reset timestamp for the request, it will go through the period again.
+      slot.requestTime = uint40(block.timestamp);
+      (, , ProcessType processType) = slotdataToParams(slot.slotdata);
+      // used: true, disputed: false, ProcessType: processType
+      slot.slotdata = paramsToSlotdata(true, false, processType);
+
     } else {
-      // challenger won.
-      emit RequestRejected(dispute.slotId);
+      // challenger won. emit disputeslot to update the status to Withdrawing in the subgraph
+      emit RequestRejected(dispute.slotId, disputeSlot);
+      dispute.pendingInitialWithdraw = true;
       dispute.winningParty = Party.Challenger;
+      // 5b. slot is now Free.. other slotdata doesn't matter.
+      // paramsToSlotdata(false, false, ProcessType.Add) = 0
+      slot.slotdata = 0;
     }
-    // 5. slot is now Free.. other slotdata doesn't matter.
-    // paramsToSlotdata(false, false, ProcessType.Add) = 0
-    slot.slotdata = 0;
+
     dispute.state = DisputeState.Withdrawing;
     emit Ruling(arbitrator, _disputeId, _ruling);
   }
@@ -723,8 +717,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   }
 
   /** @dev Withdraw the initial stake.
-  This has to be changed to only withdraw to the challenger.
-  TODO
    *  @param _disputeSlot The disputeSlot to withdraw the initial stake from.
    */
   function withdrawRoundZero(uint64 _disputeSlot) public {
@@ -739,10 +731,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(dispute.pendingInitialWithdraw, "Round zero was already withdrawn");
 
     // withdraw it. this can be put onto its own private func.
+    _withdrawRoundZero(dispute, settings);
 
     Party winningParty = dispute.winningParty;
-    _withdrawRoundZero(dispute, settings, slot, winningParty);
-
     if (dispute.pendingWithdraws[uint256(winningParty)] == 0) {
       dispute.state = DisputeState.Free;
       emit FreedDisputeSlot(_disputeSlot);
@@ -773,9 +764,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
     // this is a separate func to make it more efficient.
     // there are three contribs that are handled differently:
-    // 1. the round zero
+    // 1. the round zero, if challenger won.
     if (dispute.pendingInitialWithdraw) {
-      _withdrawRoundZero(dispute, settings, slot, winningParty);
+      _withdrawRoundZero(dispute, settings);
     }
     // 2. then, the contribs of...
     uint64 contribSlot = 0;
@@ -824,26 +815,21 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
   }
 
-  /** @dev Withdraws the initial stake to the winner.
-   *  TODO change it so that only challenger receives the withdrawal.
+  /** @dev Withdraws the initial stake to the challenger.
    *  @param _dispute The dispute whose initial stake is withdrawn, to read challenger.
    *  @param _settings The settings linked to the dispute, to read the stake.
-   *  @param _slot The slot containing the request, to read requester. TODO remove.
-   *  @param _party The party that will receive the reward, TODO remove.
    */
   function _withdrawRoundZero(
     DisputeSlot storage _dispute,
-    Settings storage _settings,
-    Slot storage _slot,
-    Party _party
+    Settings storage _settings
   ) private {
-    // this method is already told who won.
     uint256 amount = decompressAmount(_settings.requesterStake);
-    if (_party == Party.Requester) {
-      payable(_slot.requester).transfer(amount);
-    } else if (_party == Party.Challenger) {
-      payable(_dispute.challenger).transfer(amount);
-    }
+    // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
+    // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
+    // it would break withdrawAllContributions as currently designed,
+    // and for single withdraws, then sending the ether will have to be the very last thing that occurs
+    // after all the flags have been modified.
+    payable(_dispute.challenger).send(amount);
   }
 
   /** @dev Withdraws a contribution as a reward.
@@ -858,9 +844,10 @@ contract SlotCurate is IArbitrable, IEvidence {
   ) private {
     uint256 spoils = decompressAmount(_roundContributions.partyTotal[0] + _roundContributions.partyTotal[1] - _roundContributions.appealCost);
     uint256 share = (spoils * uint256(_contribution.amount)) / uint256(_roundContributions.partyTotal[uint256(_winningParty)]);
-    // should use send instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
+    // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
     // if a transaction reverts due to not enough gas, does the send() ether remain sent?
-    payable(_contribution.contributor).transfer(share);
+    // read thoughts for _withdrawRoundZero ^^^
+    payable(_contribution.contributor).send(share);
   }
 
   /** @dev Refunds a contribution when the round for that contribution wasn't appealed.
