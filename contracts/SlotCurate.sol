@@ -38,11 +38,8 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 
     TODO prepend internal view funcs with _
 
-    Some thoughts, having events for contributions would allow to check
-    what the cost of withdrawing all contributions is, so that user can
-    set the proper gas limit.
-    Also, would allow user to check all their contributions, if there
-    were many by the same address... it should be important.
+    make an event to signal the creation of a new round? or can the subgraph listen to arbitrator
+    and get this information that way? this doesn't have to be optimized at all.
 */
 
 /**
@@ -149,6 +146,9 @@ contract SlotCurate is IArbitrable, IEvidence {
   event RequestAccepted(uint64 _slotId); // when request is executed after requestPeriod
 
   event RequestChallenged(uint64 _slotId, uint64 _disputeSlot);
+
+  event NextRound(uint64 _disputeSlot);
+
   // both events below signal that the Dispute is in Withdrawing state.
   event RequestRejected(uint64 _slotId, uint64 _disputeSlot); // when dispute rules to reject the request
   event DisputeFailed(uint64 _disputeSlot); // signals that the request has its request period reset.
@@ -628,8 +628,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     roundContributions.partyTotal[1] = 0;
     roundContributions.filler = 1; // to avoid getting whole storage slot to 0.
 
-    // you may to emit an event for this. but there's no need
-    // arbitrator will surely do it for you
+    // this may not be needed, if the subgraph listens to the arbitrator
+    // done because optimizing ~500 gas in the appeal function is not a priority
+    emit NextRound(_disputeSlot);
   }
 
   /** @dev Give a ruling for a dispute. Can only be called by the arbitrator. TRUSTED.
