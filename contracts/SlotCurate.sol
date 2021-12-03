@@ -154,7 +154,18 @@ contract SlotCurate is IArbitrable, IEvidence {
   event RequestRejected(uint64 _slotId, uint64 _disputeSlot); // when dispute rules to reject the request
   event DisputeFailed(uint64 _disputeSlot); // signals that the request has its request period reset.
 
-  event FreedDisputeSlot(uint64 _disputeSlot); // called when dispute has no withdraws remaining
+  // called when dispute has no withdraws remaining
+  // automatically considers all pending contributions to be withdrawn (or, it deletes them)
+  event FreedDisputeSlot(uint64 _disputeSlot);
+
+  // this is to be able to query the contributions status from the subgraph,
+  // applied when calling single withdraw functions.
+  // to signal when the initial withdraw happens, in case dispute is successful.
+  event WithdrawnStake(uint64 _disputeSlot);
+  // contributionSlot does not have to be emitted because subgraph can count.
+  event Contribute(uint64 _disputeSlot, uint8 _round, uint80 _amount, Party _party);
+
+  event WithdrawnContribution(uint64 _disputeSlot, uint64 _contributionSlot);
 
   // CONTRACT STORAGE //
 
@@ -586,6 +597,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     // pendingWithdrawal = true, party = _party
     uint8 contribdata = paramsToContribdata(true, _party);
     contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: nextRound, contribdata: contribdata, contributor: msg.sender, amount: amount});
+    emit Contribute(_disputeSlot, nextRound, amount, _party);
   }
 
   /** @dev Appeal a dispute and start the next round. It will use the contributed funds.
@@ -712,7 +724,7 @@ contract SlotCurate is IArbitrable, IEvidence {
       // set contribution as withdrawn. party doesn't matter, so it's chosen as Party.Requester
       // (pendingWithdrawal = false, party = Party.Requester) => paramsToContribution(false, Party.Requester) = 0
       contribution.contribdata = 0;
-      // TODO emit event when withdrawing? should use subgraph to show pending contribs?
+      emit WithdrawnContribution(_disputeSlot, _contributionSlot);
     }
   }
 
@@ -739,6 +751,7 @@ contract SlotCurate is IArbitrable, IEvidence {
       emit FreedDisputeSlot(_disputeSlot);
     } else {
       dispute.pendingInitialWithdraw = false;
+      emit WithdrawnStake(_disputeSlot);
     }
   }
 
