@@ -21,19 +21,15 @@ import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 
     why not compress the function arguments? saves ~300 gas per argument...
 
+    (assuming current prediction market contribution system sticks)
     should we keep the contributions of losing parties in rounds in which only
     losing party contributes, burned inside the contract?
     or have a way to rescue those spoils, somehow?
 
     you can, when you make a contrib, check if the contrib is enough to launch the appeal
     instead of launching the appeal separatedly
-    the problem is that this would make contribute() more expensive
-
-    you can use a similar logic to:
-    - if appealCost == 0, call appealCost() and cache it
-    - when the threshold is reached, check external appealCost, if enough, advance to next round.
-    but, where do you store the appealCost?
-    this could be achieved by storing amounts in uint64, for example
+    the problem is that this would make contribute() more expensive.
+    You'd have to view appealCost every single contribution.
 */
 
 /**
