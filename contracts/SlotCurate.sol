@@ -105,8 +105,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     address challenger; // store it here instead of contributions[dispute][0]
     DisputeState state;
     uint8 currentRound;
-    bool pendingInitialWithdraw;
-    uint8 freeSpace;
+    uint16 freeSpace;
     uint64 nContributions;
     uint64[2] pendingWithdraws; // pendingWithdraws[_party], used to set the disputeSlot free
     uint40 appealDeadline;
@@ -158,13 +157,9 @@ contract SlotCurate is IArbitrable, IEvidence {
   // automatically considers all pending contributions to be withdrawn (or, it deletes them)
   event FreedDisputeSlot(uint64 _disputeSlot);
 
-  // this is to be able to query the contributions status from the subgraph,
-  // applied when calling single withdraw functions.
-  // to signal when the initial withdraw happens, in case dispute is successful.
-  event WithdrawnStake(uint64 _disputeSlot);
+  // these are to be able to query the contributions status from the subgraph,
   // contributionSlot does not have to be emitted because subgraph can count.
   event Contribute(uint64 _disputeSlot, uint8 _round, uint80 _amount, Party _party);
-
   event WithdrawnContribution(uint64 _disputeSlot, uint64 _contributionSlot);
 
   // CONTRACT STORAGE //
@@ -523,8 +518,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     dispute.challenger = msg.sender;
     dispute.state = DisputeState.Used;
     dispute.currentRound = 0;
-    // will be set to true if challenger wins.
-    dispute.pendingInitialWithdraw = false;
+
     dispute.nContributions = 0;
     dispute.pendingWithdraws[0] = 0;
     dispute.pendingWithdraws[1] = 0;
@@ -670,11 +664,20 @@ contract SlotCurate is IArbitrable, IEvidence {
     } else {
       // challenger won. emit disputeslot to update the status to Withdrawing in the subgraph
       emit RequestRejected(dispute.slotId, disputeSlot);
-      dispute.pendingInitialWithdraw = true;
       dispute.winningParty = Party.Challenger;
       // 5b. slot is now Free.. other slotdata doesn't matter.
       // paramsToSlotdata(false, false, ProcessType.Add) = 0
       slot.slotdata = 0;
+
+      // now, award the requesterStake to challenger
+      Settings storage settings = settingsMap[slot.settingsId];
+      uint256 amount = decompressAmount(settings.requesterStake);
+      // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
+      // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
+      // it would break withdrawAllContributions as currently designed,
+      // and for single withdraws, then sending the ether will have to be the very last thing that occurs
+      // after all the flags have been modified.
+      payable(dispute.challenger).send(amount);
     }
 
     dispute.state = DisputeState.Withdrawing;
@@ -714,7 +717,7 @@ contract SlotCurate is IArbitrable, IEvidence {
       payable(contribution.contributor).transfer(refund);
     }
 
-    if (dispute.pendingWithdraws[uint256(winningParty)] == 1 && !dispute.pendingInitialWithdraw) {
+    if (dispute.pendingWithdraws[uint256(winningParty)] == 1) {
       // this was last contrib remaining
       // no need to decrement pendingWithdraws if last. saves gas.
       dispute.state = DisputeState.Free;
@@ -725,33 +728,6 @@ contract SlotCurate is IArbitrable, IEvidence {
       // (pendingWithdrawal = false, party = Party.Requester) => paramsToContribution(false, Party.Requester) = 0
       contribution.contribdata = 0;
       emit WithdrawnContribution(_disputeSlot, _contributionSlot);
-    }
-  }
-
-  /** @dev Withdraw the initial stake.
-   *  @param _disputeSlot The disputeSlot to withdraw the initial stake from.
-   */
-  function withdrawRoundZero(uint64 _disputeSlot) public {
-    // "round zero" refers to the initial requester stake
-    // it's not stored like the other contributions.
-    DisputeSlot storage dispute = disputes[_disputeSlot];
-    Slot storage slot = slots[dispute.slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
-
-    require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
-
-    require(dispute.pendingInitialWithdraw, "Round zero was already withdrawn");
-
-    // withdraw it. this can be put onto its own private func.
-    _withdrawRoundZero(dispute, settings);
-
-    Party winningParty = dispute.winningParty;
-    if (dispute.pendingWithdraws[uint256(winningParty)] == 0) {
-      dispute.state = DisputeState.Free;
-      emit FreedDisputeSlot(_disputeSlot);
-    } else {
-      dispute.pendingInitialWithdraw = false;
-      emit WithdrawnStake(_disputeSlot);
     }
   }
 
@@ -767,8 +743,6 @@ contract SlotCurate is IArbitrable, IEvidence {
 
     // check if dispute is used.
     DisputeSlot storage dispute = disputes[_disputeSlot];
-    Slot storage slot = slots[dispute.slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
     // withdrawAllRewards does not set the flag on "withdrawn" individually.
     // that's why you check for dispute as well.
     require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
@@ -776,17 +750,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     Party winningParty = dispute.winningParty;
     uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
     // this is a separate func to make it more efficient.
-    // there are three contribs that are handled differently:
-    // 1. the round zero, if challenger won.
-    if (dispute.pendingInitialWithdraw) {
-      _withdrawRoundZero(dispute, settings);
-    }
-    // 2. then, the contribs of...
+    // there are two types of contribs that are handled differently:
+    // 1. the contributions of appealed rounds.
     uint64 contribSlot = 0;
     uint8 currentRound = 1;
     RoundContributions memory roundContributions = roundContributionsMap[_disputeSlot][currentRound];
-    // 2.1. the fully funded and appealed rounds
-    // withdraw to pending winners
     while (contribSlot < dispute.nContributions) {
       Contribution memory contribution = contributions[_disputeSlot][contribSlot];
       if (contribution.round != currentRound) {
@@ -801,15 +769,16 @@ contract SlotCurate is IArbitrable, IEvidence {
       contribSlot++;
     }
 
-    // 2.2. the last, unnappealed round
+    // 2. the contributions of the last, unappealed round.
     while (contribSlot < dispute.nContributions) {
       // refund every transaction
       Contribution memory contribution = contributions[_disputeSlot][contribSlot];
       _refundContribution(contribution);
       contribSlot++;
     }
-    // afterwards, set the dispute slot to Free.
+    // afterwards, set the dispute slot Free.
     dispute.state = DisputeState.Free;
+    emit FreedDisputeSlot(_disputeSlot);
   }
 
   // PRIVATE FUNCTIONS
@@ -828,23 +797,6 @@ contract SlotCurate is IArbitrable, IEvidence {
     }
   }
 
-  /** @dev Withdraws the initial stake to the challenger.
-   *  @param _dispute The dispute whose initial stake is withdrawn, to read challenger.
-   *  @param _settings The settings linked to the dispute, to read the stake.
-   */
-  function _withdrawRoundZero(
-    DisputeSlot storage _dispute,
-    Settings storage _settings
-  ) private {
-    uint256 amount = decompressAmount(_settings.requesterStake);
-    // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
-    // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
-    // it would break withdrawAllContributions as currently designed,
-    // and for single withdraws, then sending the ether will have to be the very last thing that occurs
-    // after all the flags have been modified.
-    payable(_dispute.challenger).send(amount);
-  }
-
   /** @dev Withdraws a contribution as a reward.
    *  @param _contribution The contribution to be withdrawn.
    *  @param _roundContributions The contributions of the round to figure out the reward.
@@ -858,8 +810,10 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 spoils = decompressAmount(_roundContributions.partyTotal[0] + _roundContributions.partyTotal[1] - _roundContributions.appealCost);
     uint256 share = (spoils * uint256(_contribution.amount)) / uint256(_roundContributions.partyTotal[uint256(_winningParty)]);
     // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
-    // if a transaction reverts due to not enough gas, does the send() ether remain sent?
-    // read thoughts for _withdrawRoundZero ^^^
+    // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
+    // it would break withdrawAllContributions as currently designed,
+    // and for single withdraws, then sending the ether will have to be the very last thing that occurs
+    // after all the flags have been modified.
     payable(_contribution.contributor).send(share);
   }
 
