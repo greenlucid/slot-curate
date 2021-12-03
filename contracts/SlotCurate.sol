@@ -281,9 +281,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_idSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Add
-    // paramsToSlotdata(true, false, ProcessType.Add) = 128
+    // _paramsToSlotdata(true, false, ProcessType.Add) = 128
     slot.slotdata = 128;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -309,11 +309,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _fromSlot,
     string calldata _ipfsUri
   ) external payable {
-    uint64 workSlot = firstFreeSlot(_fromSlot);
-    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    uint64 workSlot = _firstFreeSlot(_fromSlot);
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     Slot storage slot = slots[workSlot];
     // used: true, disputed: false, processType: Add
-    // paramsToSlotdata(true, false, ProcessType.Add) = 128
+    // _paramsToSlotdata(true, false, ProcessType.Add) = 128
     slot.slotdata = 128;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -346,9 +346,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Removal
-    // paramsToSlotdata(true, false, ProcessType.Removal) = 144
+    // _paramsToSlotdata(true, false, ProcessType.Removal) = 144
     slot.slotdata = 144;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -381,11 +381,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _itemId,
     string calldata _reason
   ) external payable {
-    uint64 workSlot = firstFreeSlot(_fromSlot);
+    uint64 workSlot = _firstFreeSlot(_fromSlot);
     Slot storage slot = slots[workSlot];
-    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Removal
-    // paramsToSlotdata(true, false, ProcessType.Removal) = 144
+    // _paramsToSlotdata(true, false, ProcessType.Removal) = 144
     slot.slotdata = 144;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -421,9 +421,9 @@ contract SlotCurate is IArbitrable, IEvidence {
     Slot storage slot = slots[_workSlot];
     // If free, it is of form 0xxx0000, so it's smaller than 128
     require(slot.slotdata < 128, "Slot must not be in use");
-    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Edit
-    // paramsToSlotdata(true, false, ProcessType.Edit) = 160
+    // _paramsToSlotdata(true, false, ProcessType.Edit) = 160
     slot.slotdata = 160;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -453,11 +453,11 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _itemId,
     string calldata _ipfsUri
   ) external payable {
-    uint64 workSlot = firstFreeSlot(_fromSlot);
+    uint64 workSlot = _firstFreeSlot(_fromSlot);
     Slot storage slot = slots[workSlot];
-    require(msg.value >= decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
     // used: true, disputed: false, processType: Edit
-    // paramsToSlotdata(true, false, ProcessType.Edit) = 160
+    // _paramsToSlotdata(true, false, ProcessType.Edit) = 160
     slot.slotdata = 160;
     slot.requestTime = uint40(block.timestamp);
     slot.requester = msg.sender;
@@ -474,11 +474,11 @@ contract SlotCurate is IArbitrable, IEvidence {
   function executeRequest(uint64 _slotId) external {
     Slot storage slot = slots[_slotId];
     Settings storage settings = settingsMap[slot.settingsId];
-    require(slotIsExecutable(slot, settings.requestPeriod), "Slot cannot be executed");
+    require(_slotIsExecutable(slot, settings.requestPeriod), "Slot cannot be executed");
     payable(slot.requester).transfer(settings.requesterStake);
     emit RequestAccepted(_slotId);
     // used to false, others don't matter.
-    // paramsToSlotdata(false, false, ProcessType.Add) = 0
+    // _paramsToSlotdata(false, false, ProcessType.Add) = 0
     slot.slotdata = 0;
   }
 
@@ -497,7 +497,7 @@ contract SlotCurate is IArbitrable, IEvidence {
   ) public payable {
     Slot storage slot = slots[_slotId];
     Settings storage settings = settingsMap[slot.settingsId];
-    require(slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
+    require(_slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
 
     DisputeSlot storage dispute = disputes[_disputeSlot];
     require(dispute.state == DisputeState.Free, "That dispute slot is being used");
@@ -509,8 +509,8 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 arbitratorDisputeId = arbitrator.createDispute{value: msg.value}(RULING_OPTIONS, settings.arbitratorExtraData);
     // store disputeId -> disputeSlot for ruling later on. challenger pays this 20k cost.
     disputeIdToDisputeSlot[arbitratorDisputeId] = _disputeSlot;
-    (, , ProcessType processType) = slotdataToParams(slot.slotdata);
-    uint8 newSlotdata = paramsToSlotdata(true, true, processType);
+    (, , ProcessType processType) = _slotdataToParams(slot.slotdata);
+    uint8 newSlotdata = _paramsToSlotdata(true, true, processType);
 
     slot.slotdata = newSlotdata;
     dispute.arbitratorDisputeId = arbitratorDisputeId;
@@ -557,7 +557,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint64 _fromSlot,
     string calldata _reason
   ) public payable {
-    uint64 disputeWorkSlot = firstFreeDisputeSlot(_fromSlot);
+    uint64 disputeWorkSlot = _firstFreeDisputeSlot(_fromSlot);
     challengeRequest(_slotId, disputeWorkSlot, _reason);
   }
 
@@ -584,12 +584,12 @@ contract SlotCurate is IArbitrable, IEvidence {
     dispute.nContributions++;
     dispute.pendingWithdraws[uint256(_party)]++;
     // compress amount, possibly losing up to 4 gwei. they will be burnt.
-    uint80 amount = compressAmount(msg.value);
+    uint80 amount = _compressAmount(msg.value);
     uint8 nextRound = dispute.currentRound + 1;
     roundContributionsMap[_disputeSlot][nextRound].partyTotal[uint256(_party)] += amount;
 
     // pendingWithdrawal = true, party = _party
-    uint8 contribdata = paramsToContribdata(true, _party);
+    uint8 contribdata = _paramsToContribdata(true, _party);
     contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: nextRound, contribdata: contribdata, contributor: msg.sender, amount: amount});
     emit Contribute(_disputeSlot, nextRound, amount, _party);
   }
@@ -610,14 +610,14 @@ contract SlotCurate is IArbitrable, IEvidence {
     uint256 totalAmountNeeded = (appealCost * settings.multiplier) / DIVIDER;
 
     // make sure you have the required amount
-    uint256 currentAmount = decompressAmount(roundContributionsMap[_disputeSlot][nextRound].partyTotal[0] + roundContributionsMap[_disputeSlot][nextRound].partyTotal[1]);
+    uint256 currentAmount = _decompressAmount(roundContributionsMap[_disputeSlot][nextRound].partyTotal[0] + roundContributionsMap[_disputeSlot][nextRound].partyTotal[1]);
     require(currentAmount >= totalAmountNeeded, "Not enough to fund round");
 
     // got enough, it's legit to do so. I can appeal, lets appeal
     arbitrator.appeal{value: appealCost}(dispute.arbitratorDisputeId, settings.arbitratorExtraData);
 
     // remember the appeal cost, for sharing the spoils later
-    roundContributionsMap[_disputeSlot][nextRound].appealCost = compressAmount(appealCost);
+    roundContributionsMap[_disputeSlot][nextRound].appealCost = _compressAmount(appealCost);
 
     dispute.currentRound++;
 
@@ -658,21 +658,21 @@ contract SlotCurate is IArbitrable, IEvidence {
       // dispute.pendingInitialWithdraw stays at false, because challenger lost.
       // 5a. reset timestamp for the request, it will go through the period again.
       slot.requestTime = uint40(block.timestamp);
-      (, , ProcessType processType) = slotdataToParams(slot.slotdata);
+      (, , ProcessType processType) = _slotdataToParams(slot.slotdata);
       // used: true, disputed: false, ProcessType: processType
-      slot.slotdata = paramsToSlotdata(true, false, processType);
+      slot.slotdata = _paramsToSlotdata(true, false, processType);
 
     } else {
       // challenger won. emit disputeslot to update the status to Withdrawing in the subgraph
       emit RequestRejected(dispute.slotId, disputeSlot);
       dispute.winningParty = Party.Challenger;
       // 5b. slot is now Free.. other slotdata doesn't matter.
-      // paramsToSlotdata(false, false, ProcessType.Add) = 0
+      // _paramsToSlotdata(false, false, ProcessType.Add) = 0
       slot.slotdata = 0;
 
       // now, award the requesterStake to challenger
       Settings storage settings = settingsMap[slot.settingsId];
-      uint256 amount = decompressAmount(settings.requesterStake);
+      uint256 amount = _decompressAmount(settings.requesterStake);
       // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
       // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
       // it would break withdrawAllContributions as currently designed,
@@ -696,7 +696,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     require(dispute.nContributions > _contributionSlot, "DisputeSlot lacks that contrib");
 
     Contribution storage contribution = contributions[_disputeSlot][_contributionSlot];
-    (bool pendingWithdrawal, Party party) = contribdataToParams(contribution.contribdata);
+    (bool pendingWithdrawal, Party party) = _contribdataToParams(contribution.contribdata);
 
     require(pendingWithdrawal, "Contribution withdrawn already");
 
@@ -714,7 +714,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     } else {
       // this is a contrib from a round that didnt get appealed.
       // just refund the same amount
-      uint256 refund = decompressAmount(contribution.amount);
+      uint256 refund = _decompressAmount(contribution.amount);
       payable(contribution.contributor).transfer(refund);
     }
 
@@ -808,7 +808,7 @@ contract SlotCurate is IArbitrable, IEvidence {
     RoundContributions memory _roundContributions,
     Party _winningParty
   ) private {
-    uint256 spoils = decompressAmount(_roundContributions.partyTotal[0] + _roundContributions.partyTotal[1] - _roundContributions.appealCost);
+    uint256 spoils = _decompressAmount(_roundContributions.partyTotal[0] + _roundContributions.partyTotal[1] - _roundContributions.appealCost);
     uint256 share = (spoils * uint256(_contribution.amount)) / uint256(_roundContributions.partyTotal[uint256(_winningParty)]);
     // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
     // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
@@ -822,7 +822,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _contribution The contribution to refund.
    */
   function _refundContribution(Contribution memory _contribution) private {
-    uint256 refund = decompressAmount(_contribution.amount);
+    uint256 refund = _decompressAmount(_contribution.amount);
     // should use send instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
     // if a transaction reverts due to not enough gas, does the send() ether remain sent?
     payable(_contribution.contributor).transfer(refund);
@@ -836,7 +836,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _startPoint The point from which you start looking for a free slot.
    *  @return The first free request slot from the starting point.
    */
-  function firstFreeSlot(uint64 _startPoint) internal view returns (uint64) {
+  function _firstFreeSlot(uint64 _startPoint) internal view returns (uint64) {
     uint64 i = _startPoint;
     // this is used == true, because if used, slotdata is of shape 1xxx0000, so it's larger than 127
     while (slots[i].slotdata > 127) {
@@ -851,7 +851,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _startPoint The point from which you start looking for a free slot.
    *  @return The first free dispute slot from the starting point.
    */
-  function firstFreeDisputeSlot(uint64 _startPoint) internal view returns (uint64) {
+  function _firstFreeDisputeSlot(uint64 _startPoint) internal view returns (uint64) {
     uint64 i = _startPoint;
     while (disputes[i].state == DisputeState.Used) {
       i++;
@@ -864,8 +864,8 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _requestPeriod The period the request has to last to be executable.
    *  @return True if the slot can be executed, false otherwise.
    */
-  function slotIsExecutable(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
-    (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
+  function _slotIsExecutable(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
+    (bool used, bool disputed, ) = _slotdataToParams(_slot.slotdata);
     return used && (block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
   }
 
@@ -874,8 +874,8 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _requestPeriod The period the request has to last to be executable.
    *  @return True if the slot can be executed, false otherwise.
    */
-  function slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
-    (bool used, bool disputed, ) = slotdataToParams(_slot.slotdata);
+  function _slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
+    (bool used, bool disputed, ) = _slotdataToParams(_slot.slotdata);
     return used && !(block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
   }
 
@@ -896,7 +896,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _processType The type of request contained in the slot (add, removal, edit)
    *  @return The compressed data.
    */
-  function paramsToSlotdata(
+  function _paramsToSlotdata(
     bool _used,
     bool _disputed, // you store disputed to stop someone from calling executeRequest
     ProcessType _processType
@@ -916,7 +916,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _slotdata The slotdata to decompress.
    *  @return (used, disputed, processType), the decompressed variables of the slotdata.
    */
-  function slotdataToParams(uint8 _slotdata)
+  function _slotdataToParams(uint8 _slotdata)
     internal
     pure
     returns (
@@ -941,7 +941,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _party The party supported by the contribution.
    *  @return The compressed data.
    */
-  function paramsToContribdata(bool _pendingWithdrawal, Party _party) internal pure returns (uint8) {
+  function _paramsToContribdata(bool _pendingWithdrawal, Party _party) internal pure returns (uint8) {
     uint8 pendingWithdrawalAddend;
     if (_pendingWithdrawal) pendingWithdrawalAddend = 128;
     uint8 partyAddend;
@@ -955,7 +955,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _contribdata The contribdata to decompress.
    *  @return (pendingWithdrawal, party), the decompressed variables of the contribdata.
    */
-  function contribdataToParams(uint8 _contribdata) internal pure returns (bool, Party) {
+  function _contribdataToParams(uint8 _contribdata) internal pure returns (bool, Party) {
     uint8 pendingWithdrawalAddend = _contribdata & 128;
     bool pendingWithdrawal = pendingWithdrawalAddend != 0;
     uint8 partyAddend = _contribdata & 64;
@@ -969,7 +969,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _amount The uint256 version of the amount.
    *  @return The uint80 compressed version of the amount.
    */
-  function compressAmount(uint256 _amount) internal pure returns (uint80) {
+  function _compressAmount(uint256 _amount) internal pure returns (uint80) {
     return (uint80(_amount >> AMOUNT_BITSHIFT));
   }
 
@@ -977,7 +977,7 @@ contract SlotCurate is IArbitrable, IEvidence {
    *  @param _compressedAmount The uint80 compressed version of the amount.
    *  @return The uint256 version of the amount, losing its 32 less significant bits, up to 4 gwei.
    */
-  function decompressAmount(uint80 _compressedAmount) internal pure returns (uint256) {
+  function _decompressAmount(uint80 _compressedAmount) internal pure returns (uint256) {
     return (uint256(_compressedAmount) << AMOUNT_BITSHIFT);
   }
 }
