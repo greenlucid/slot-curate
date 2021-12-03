@@ -830,6 +830,44 @@ contract SlotCurate is IArbitrable, IEvidence {
 
   // VIEW FUNCTIONS
 
+  // These three public view functions, I don't think they're necessary to have them here.
+  // You can get the arbitrator and make a query to check this directly in the frontend,
+  // all the needed data to make these queries is in the subgraph.
+  // Give me your opinion on removing them.
+
+  /** @dev Check the challenge fee a challenger would incur if challenging a request.
+   *  @param _slotId The id of the slot.
+   *  @return The arbitration fee to challenge a request.
+   */
+  function challengeFee(uint64 _slotId) public view returns (uint256) {
+    Slot storage slot = slots[_slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+
+    return (arbitrator.arbitrationCost(settings.arbitratorExtraData));
+  }
+
+  /** @dev Get the cost of making an appeal for a dispute.
+   *  @param _disputeSlot The slot containing the dispute.
+   *  @return The cost of appealing the dispute.
+   */
+  function appealCost(uint64 _disputeSlot) public view returns (uint256) {
+    DisputeSlot memory disputeSlot = disputes[_disputeSlot];
+    Slot memory slot = slots[disputeSlot.slotId];
+    Settings memory settings = settingsMap[slot.settingsId];
+    return(arbitrator.appealCost(disputeSlot.arbitratorDisputeId, settings.arbitratorExtraData));
+  }
+
+  /** @dev Get the appeal period of making an appeal for a dispute.
+   *  @param _disputeSlot The slot containing the dispute.
+   *  @return (start, end) the two instants of time you can appeal a dispute.
+   */
+  function appealPeriod(uint64 _disputeSlot) public view returns (uint256, uint256) {
+    DisputeSlot memory disputeSlot = disputes[_disputeSlot];
+    return(arbitrator.appealPeriod(disputeSlot.arbitratorDisputeId));
+  }
+
+  // From here, all view functions are internal.
+
   /** @dev Get the first free request slot from a given point.
    *  Relying on this in the frontend could result in collisions.
    *  This view function is used for the frontrun protection request functions.
@@ -877,17 +915,6 @@ contract SlotCurate is IArbitrable, IEvidence {
   function _slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
     (bool used, bool disputed, ) = _slotdataToParams(_slot.slotdata);
     return used && !(block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
-  }
-
-  /** @dev Check the challenge fee a challenger would incur if challenging a request.
-   *  @param _slotId The id of the slot.
-   *  @return The arbitration fee to challenge a request.
-   */
-  function challengeFee(uint64 _slotId) public view returns (uint256) {
-    Slot storage slot = slots[_slotId];
-    Settings storage settings = settingsMap[slot.settingsId];
-
-    return (arbitrator.arbitrationCost(settings.arbitratorExtraData));
   }
 
   /** @dev Compress slot request variables for storage.
