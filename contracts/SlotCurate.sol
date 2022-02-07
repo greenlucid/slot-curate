@@ -1,474 +1,977 @@
 /**
- * @authors: @greenlucid
+ * @authors: [@greenlucid]
  * @reviewers: []
  * @auditors: []
  * @bounties: []
  * @deployments: []
  * SPDX-License-Identifier: Licenses are not real
  */
- 
- pragma solidity ^0.8.9;
+
+pragma solidity ^0.8.4;
+import "@kleros/erc-792/contracts/IArbitrable.sol";
+import "@kleros/erc-792/contracts/IArbitrator.sol";
+import "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 
 /*
     things to think about
-    
-    put an option to manually call the function to calculate juror fees and store it locally
-    instead of calling an expensive function over contracts every time
-    this would get harder if we store arbitrator / arbextradata separately
-    
-    put the most used functions (add, remove item) as first functions because that
-    makes it cheaper
 
-    ideas for the future:
-    not even store all data to verify the process on chain. you could let invalid process on chain
-    just exist and finish, and ignore them.
-    you could even not store the lists logic at all, make them just be another item submission, somehow.
-    again, the terms will be stored off chain, so whoever doesn't play by the rules is just ignored
-    and you let their process exist and do whatever.
+    Current TODO
+
+    rename funcs to get addItem higher
+
+    why not compress the function arguments? saves ~300 gas per argument...
+
+    (assuming current prediction market contribution system sticks)
+    should we keep the contributions of losing parties in rounds in which only
+    losing party contributes, burned inside the contract?
+    or have a way to rescue those spoils, somehow?
+
+    you can, when you make a contrib, check if the contrib is enough to launch the appeal
+    instead of launching the appeal separatedly
+    the problem is that this would make contribute() more expensive.
+    You'd have to view appealCost every single contribution.
 */
 
-contract SlotCurate {
+/**
+ * @title Slot Curate
+ * @author Green
+ * @dev A gas optimized version of Curate, intended to be used with a subgraph.
+ */
+contract SlotCurate is IArbitrable, IEvidence {
+  uint256 internal constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
+  uint256 internal constant RULING_OPTIONS = 2;
+  uint256 internal constant DIVIDER = 1_000_000; // this is how you divide in solidity, or multiply by floats
 
-    uint constant AMOUNT_BITSHIFT = 32; // this could make submitter lose up to 4 gwei
-    
-    enum ProcessType {
-        Add,
-        Removal,
-        Edit
-    }
-    
-    enum Party {
-        Requester,
-        Challenger
-    }
-    
-    enum DisputeState {
-        Free, // you can take slot
-        Ruling, // arbitrator is ruling...
-        Funding // users can contribute to seed next round. could also mean "over" if timestamp.
+  enum ProcessType {
+    Add,
+    Removal,
+    Edit
+  }
+
+  enum Party {
+    Requester,
+    Challenger
+  }
+
+  enum DisputeState {
+    Free,
+    Used,
+    Withdrawing
+  }
+
+  // settings cannot be mutated once created, otherwise pending processes could get attacked.
+  struct Settings {
+    uint80 requesterStake; // this is realAmount >> AMOUNT_BITSHIFT !!!!
+    uint40 requestPeriod;
+    uint64 multiplier; // divide by DIVIDER for float.
+    uint72 freeSpace;
+    bytes arbitratorExtraData;
+  }
+
+  struct Slot {
+    uint8 slotdata; // holds "used", "processType" and "disputed", compressed in the same variable.
+    uint48 settingsId; // settings spam attack is highly unlikely (1M years of full 15M gas blocks)
+    uint40 requestTime; // overflow in 37k years
+    address requester;
+  }
+
+  // all bounded data related to the DisputeSlot. unbounded data such as contributions is handled out
+  // takes 3 slots
+  struct DisputeSlot {
+    uint256 arbitratorDisputeId; // required
+    uint64 slotId; // flexible
+    address challenger; // store it here instead of contributions[dispute][0]
+    DisputeState state;
+    uint8 currentRound;
+    uint16 freeSpace;
+    uint64 nContributions;
+    uint64[2] pendingWithdraws; // pendingWithdraws[_party], used to set the disputeSlot free
+    uint40 appealDeadline;
+    Party winningParty; // for withdrawals, set at rule()
+    uint16 freeSpace2;
+  }
+
+  struct Contribution {
+    uint8 round; // could be bigger. but because exp cost on appeal, shouldn't be needed.
+    uint8 contribdata; // compressed form of bool withdrawn, Party party.
+    uint80 amount; // to be raised 32 bits.
+    address contributor; // could be compressed to 64 bits, but there's no point.
+  }
+
+  struct RoundContributions {
+    uint80[2] partyTotal; // partyTotal[Party]
+    uint80 appealCost;
+    uint16 filler; // to make sure the storage slot never goes back to zero, set it to 1 on discovery.
+  }
+
+  // EVENTS //
+
+  event ListCreated(uint48 _settingsId, address _governor, string _ipfsUri);
+  event ListUpdated(uint64 _listId, uint48 _settingsId, address _governor);
+
+  event SettingsCreated(uint80 _requesterStake, uint40 _requestPeriod, uint64 multiplier, bytes _arbitratorExtraData);
+  // why emit settingsId in the request events?
+  // it's cheaper to trust the settingsId in the contract, than read it from the list and verifying
+  // the subgraph can check the list at that time and ignore requests with invalid settings.
+  // in an optimistic rollup, however, it will be refactored to store this information,
+
+  // every byte costs 8 gas so 80 gas saving by publishing uint176
+  event ItemAddRequest(uint176 _addRequestData, string _ipfsUri);
+  event ItemRemovalRequest(uint240 _removalRequestData);
+  event ItemEditRequest(uint240 _editRequestData, string _ipfsUri);
+  // you don't need different events for accept / reject because subgraph remembers the progress per slot.
+  event RequestAccepted(uint64 _slotId); // when request is executed after requestPeriod
+
+  event RequestChallenged(uint64 _slotId, uint64 _disputeSlot);
+
+  event NextRound(uint64 _disputeSlot);
+
+  // both events below signal that the Dispute is in Withdrawing state.
+  event RequestRejected(uint64 _slotId, uint64 _disputeSlot); // when dispute rules to reject the request
+  event DisputeFailed(uint64 _disputeSlot); // signals that the request has its request period reset.
+
+  // called when dispute has no withdraws remaining
+  // automatically considers all pending contributions to be withdrawn (or, it deletes them)
+  event FreedDisputeSlot(uint64 _disputeSlot);
+
+  // these are to be able to query the contributions status from the subgraph,
+  // contributionSlot does not have to be emitted because subgraph can count.
+  event Contribute(uint64 _disputeSlot, uint8 _round, uint80 _amount, Party _party);
+  event WithdrawnContribution(uint64 _disputeSlot, uint64 _contributionSlot);
+
+  // CONTRACT STORAGE //
+
+  IArbitrator internal immutable arbitrator; // only one arbitrator per contract. changing arbitrator requires redeployment
+  // redeploying the contract has the issue of the contract needing settings to be the same in the same order
+
+  uint48 internal settingsCount; // this gives unique ids, and allows to check if settings exist.
+
+  mapping(uint64 => Slot) internal slots;
+  mapping(uint64 => DisputeSlot) internal disputes;
+  // a spam attack would take ~1M years of full mainnet blocks to deplete settings id space.
+  mapping(uint48 => Settings) internal settingsMap;
+  mapping(uint64 => mapping(uint64 => Contribution)) internal contributions; // contributions[disputeSlot][n]
+  // roundContributionsMap[disputeSlot][round]
+  mapping(uint64 => mapping(uint8 => RoundContributions)) internal roundContributionsMap;
+  mapping(uint256 => uint64) internal disputeIdToDisputeSlot; // disputeIdToDisputeSlot[disputeId]
+
+  /** @dev Constructs the SlotCurate contract.
+   *  @param _arbitrator The address of the arbitrator.
+   *  @param _addMetaEvidence The ipfs uri of the addMetaEvidence.
+   *  @param _removalMetaEvidence The ipfs uri of the removalMetaEvidence.
+   *  @param _editMetaEvidence The ipfs uri of the editMetaEvidence.
+   */
+  constructor(
+    address _arbitrator,
+    string memory _addMetaEvidence,
+    string memory _removalMetaEvidence,
+    string memory _editMetaEvidence
+  ) {
+    arbitrator = IArbitrator(_arbitrator);
+
+    emit MetaEvidence(0, _addMetaEvidence);
+    emit MetaEvidence(1, _removalMetaEvidence);
+    emit MetaEvidence(2, _editMetaEvidence);
+  }
+
+  // PUBLIC FUNCTIONS
+
+  /** @dev Creates a list that is stored in the subgraph. Its ID will be determined by a counter in the subgraph.
+   *  @param _settingsId The id of the settings this list uses. It's verified in the subgraph.
+   *  @param _governor The address of the list's governor, that's allowed to update the list.
+   *  @param _ipfsUri The ipfs uri of the document detailing the submission requirements for the list.
+   */
+  function createList(
+    uint48 _settingsId,
+    address _governor,
+    string calldata _ipfsUri
+  ) external {
+    // the following statement is not needed because it will be verified in the subgraph
+    // require(_settingsId < settingsCount, "Settings must exist");
+    emit ListCreated(_settingsId, _governor, _ipfsUri);
+  }
+
+  /** @dev Updates a list in the subgraph. Subgraph won't accept the update if the msg.sender is not _governor.
+   *  Update does NOT allow changing _ipfsUri of the rules of the list, as that would be unfair
+   *  if the rules change after unfinished requests are made, or while disputes are taking place.
+   *  @param _listId The id of the list to be updated.
+   *  @param _settingsId The id of the new settings of the list. It's verified to exist in the subgraph.
+   *  @param _newGovernor The address of the new governor of the list.
+   */
+  function updateList(
+    uint64 _listId,
+    uint48 _settingsId,
+    address _newGovernor
+  ) external {
+    emit ListUpdated(_listId, _settingsId, _newGovernor);
+  }
+
+  /** @dev Creates a settings, and stores it in the contract. Settings are immutable.
+   *  @param _requesterStake The stake needed to make any request, be it add, edit or remove.
+   *  It has to be already shifted right by 32 bits.
+   *  @param _requestPeriod The period of time in seconds that the request must stay unchallenged
+   *  To be added to the list.
+   *  @param _multiplier A number used to calculate how much more amount is needed to appeal.
+   *  When submitted, it has to be already multiplied by DIVIDER.
+   *  @param _arbitratorExtraData The arbitratorExtraData used to create disputes.
+   */
+  function createSettings(
+    uint80 _requesterStake,
+    uint40 _requestPeriod,
+    uint64 _multiplier,
+    bytes calldata _arbitratorExtraData
+  ) external {
+    // require is not used. there can be up to 281T.
+    // that's 1M years of full 15M gas blocks every 13s.
+    // skipping it makes this cheaper. overflow is not gonna happen.
+    // a rollup in which this was a risk might be possible, but then just remake the contract.
+    // require(settingsCount != type(uint48).max, "Max settings reached");
+    Settings storage settings = settingsMap[settingsCount++];
+    settings.requesterStake = _requesterStake;
+    settings.requestPeriod = _requestPeriod;
+    settings.multiplier = _multiplier;
+    settings.arbitratorExtraData = _arbitratorExtraData;
+    emit SettingsCreated(_requesterStake, _requestPeriod, _multiplier, _arbitratorExtraData);
+  }
+
+  // None of the requests have refunds for overpaying. Consider the excess burned.
+  // It is expected of the frontend to make the transaction with the
+  // least significant bits set to zero in amount, to protect caller from losing those 4 gwei.
+
+  /** @dev Creates a request to add an item to a list.
+   *  @param _listId The id of the list the item is added to.
+   *  If the list doesn't exist, the subgraph will ignore the request.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _idSlot The id of the slot in which the request will have its lifecycle.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _ipfsUri The ipfs uri of the data of the item to be submitted to the list.
+   */
+  function addItem(
+    uint64 _listId,
+    uint48 _settingsId,
+    uint64 _idSlot,
+    string calldata _ipfsUri
+  ) external payable {
+    Slot storage slot = slots[_idSlot];
+    // If free, it is of form 0xxx0000, so it's smaller than 128
+    require(slot.slotdata < 128, "Slot must not be in use");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Add
+    // _paramsToSlotdata(true, false, ProcessType.Add) = 128
+    slot.slotdata = 128;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
+    // LLLLLLLLSSSSSSIIIIIIII
+    emit ItemAddRequest(((_listId << 14) + (_settingsId << 8) + _idSlot), _ipfsUri);
+  }
+
+  /** @dev Equivalent to addItem, but with frontrun protection.
+   *  @param _listId The id of the list the item is added to.
+   *  If the list doesn't exist, the subgraph will ignore the request.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _fromSlot The id of the slot to start iterating from.
+   *  The function will create the request in the first available slot it finds.
+   *  @param _ipfsUri The ipfs uri of the data of the item to be submitted to the list.
+   */
+  function addItemInFirstFreeSlot(
+    uint64 _listId,
+    uint48 _settingsId,
+    uint64 _fromSlot,
+    string calldata _ipfsUri
+  ) external payable {
+    uint64 workSlot = _firstFreeSlot(_fromSlot);
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    Slot storage slot = slots[workSlot];
+    // used: true, disputed: false, processType: Add
+    // _paramsToSlotdata(true, false, ProcessType.Add) = 128
+    slot.slotdata = 128;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint176 addRequestData: [List: L, Settings: S, idSlot: I]
+    // LLLLLLLLSSSSSSIIIIIIII
+    emit ItemAddRequest(((_listId << 14) + (_settingsId << 8) + workSlot), _ipfsUri);
+  }
+
+  /** @dev Creates a request to remove an item from a list.
+   *  @param _workSlot The slot in which the request will be processed.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is removed from.
+   *  If the list doesn't exist, the subgraph will ignore the request.
+   *  @param _itemId The id of the item to be removed from the list.
+   *  @param _reason The ipfs uri of the reason to remove the item from the list.
+   *  If incorrect, even if the item does not belong to the list for any other reason,
+   *  It should be disputed as a failed request.
+   */
+  function removeItem(
+    uint64 _workSlot,
+    uint48 _settingsId,
+    uint64 _listId,
+    uint64 _itemId,
+    string calldata _reason
+  ) external payable {
+    Slot storage slot = slots[_workSlot];
+    // If free, it is of form 0xxx0000, so it's smaller than 128
+    require(slot.slotdata < 128, "Slot must not be in use");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Removal
+    // _paramsToSlotdata(true, false, ProcessType.Removal) = 144
+    slot.slotdata = 144;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint240 removeRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    emit ItemRemovalRequest((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
+    // the evidenceGroupId is the one of this one request.
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_workSlot, uint40(block.timestamp))));
+    emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
+  }
+
+  /** @dev Equivalent to removeItem, but with frontrun protection.
+   *  @param _fromSlot The id of the slot to start iterating from.
+   *  The function will create the request in the first available slot it finds.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is removed from.
+   *  If the list doesn't exist, the subgraph will ignore the request.
+   *  @param _itemId The id of the item to be removed from the list.
+   *  @param _reason The ipfs uri of the reason to remove the item from the list.
+   *  If incorrect, even if the item does not belong to the list for any other reason,
+   *  It should be disputed as a failed request.
+   */
+  function removeItemInFirstFreeSlot(
+    uint64 _fromSlot,
+    uint48 _settingsId,
+    uint64 _listId,
+    uint64 _itemId,
+    string calldata _reason
+  ) external payable {
+    uint64 workSlot = _firstFreeSlot(_fromSlot);
+    Slot storage slot = slots[workSlot];
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Removal
+    // _paramsToSlotdata(true, false, ProcessType.Removal) = 144
+    slot.slotdata = 144;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint240 removeRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    emit ItemRemovalRequest((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId);
+    // the evidenceGroupId is the one of this one request.
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(workSlot, uint40(block.timestamp))));
+    emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
+  }
+
+  /** @dev Creates a request to edit an item in a list.
+   *  @param _workSlot The slot in which the request will be processed.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is edited in.
+   *  If the list doesn't exist, the subgraph will ignore the request.
+   *  @param _itemId The id of the item to be edited in the list.
+   *  @param _ipfsUri The ipfs uri that links to the new data for the item.
+   *  It will replace the previous data completely, but the item will maintain
+   *  the same id inside the list.
+   */
+  function editItem(
+    uint64 _workSlot,
+    uint48 _settingsId,
+    uint64 _listId,
+    uint64 _itemId,
+    string calldata _ipfsUri
+  ) external payable {
+    Slot storage slot = slots[_workSlot];
+    // If free, it is of form 0xxx0000, so it's smaller than 128
+    require(slot.slotdata < 128, "Slot must not be in use");
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Edit
+    // _paramsToSlotdata(true, false, ProcessType.Edit) = 160
+    slot.slotdata = 160;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint240 editRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    emit ItemEditRequest(((_workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
+  }
+
+  /** @dev Creates a request to edit an item in a list.
+   *  @param _fromSlot The id of the slot to start iterating from.
+   *  The function will create the request in the first available slot it finds.
+   *  @param _settingsId The trusted settings belonging to that list.
+   *  It's trusted to optimize gas costs in mainnet. The subgraph will verify its correctness,
+   *  and will ignore the request if the settings are not correct.
+   *  @param _listId The id of the list the item is edited in.
+   *  If the list doesn't exist, the subgraph will ignore the request.
+   *  @param _itemId The id of the item to be edited in the list.
+   *  @param _ipfsUri The ipfs uri that links to the new data for the item.
+   *  It will replace the previous data completely, but the item will maintain
+   *  the same id inside the list.
+   */
+  function editItemInFirstFreeSlot(
+    uint64 _fromSlot,
+    uint48 _settingsId,
+    uint64 _listId,
+    uint64 _itemId,
+    string calldata _ipfsUri
+  ) external payable {
+    uint64 workSlot = _firstFreeSlot(_fromSlot);
+    Slot storage slot = slots[workSlot];
+    require(msg.value >= _decompressAmount(settingsMap[_settingsId].requesterStake), "Not enough to cover stake");
+    // used: true, disputed: false, processType: Edit
+    // _paramsToSlotdata(true, false, ProcessType.Edit) = 160
+    slot.slotdata = 160;
+    slot.requestTime = uint40(block.timestamp);
+    slot.requester = msg.sender;
+    slot.settingsId = _settingsId;
+    // format of uint240 editRequestData: [WorkSlot: W, Settings: S, List: L, idItem: I]
+    // WWWWWWWWSSSSSSLLLLLLLLIIIIIIII
+    emit ItemEditRequest(((workSlot << 22) + (_settingsId << 16) + (_listId << 8) + _itemId), _ipfsUri);
+  }
+
+  /** @dev Accept a request that is over the requestPeriod and undisputed.
+   *  @param _slotId The id of the slot containing the request to be accepted.
+   */
+  function executeRequest(uint64 _slotId) external {
+    Slot storage slot = slots[_slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    require(_slotIsExecutable(slot, settings.requestPeriod), "Slot cannot be executed");
+    payable(slot.requester).transfer(settings.requesterStake);
+    emit RequestAccepted(_slotId);
+    // used to false, others don't matter.
+    // _paramsToSlotdata(false, false, ProcessType.Add) = 0
+    slot.slotdata = 0;
+  }
+
+  /** @dev Challenge a request that is not over the requestPeriod.
+   *  @param _slotId The id of the slot containing the request to challenge.
+   *  @param _disputeSlot The id of the disputeSlot in which the dispute data will be stored.
+   *  This can be frontrun, so there's an equivalent function with frontrun protection.
+   *  @param _reason The ipfs uri linking to a file describing the reason the request
+   *  must be rejected. If the request is incorrect, but not for the reason the challenger
+   *  is giving, then the dispute should fail.
+   */
+  function challengeRequest(
+    uint64 _slotId,
+    uint64 _disputeSlot,
+    string calldata _reason
+  ) public payable {
+    Slot storage slot = slots[_slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    require(_slotCanBeChallenged(slot, settings.requestPeriod), "Slot cannot be challenged");
+
+    DisputeSlot storage dispute = disputes[_disputeSlot];
+    require(dispute.state == DisputeState.Free, "That dispute slot is being used");
+
+    // dont require enough to cover arbitration fees
+    // arbitrator will already take care of it
+    // challenger pays arbitration fees + gas costs fully
+
+    uint256 arbitratorDisputeId = arbitrator.createDispute{value: msg.value}(RULING_OPTIONS, settings.arbitratorExtraData);
+    // store disputeId -> disputeSlot for ruling later on. challenger pays this 20k cost.
+    disputeIdToDisputeSlot[arbitratorDisputeId] = _disputeSlot;
+    (, , ProcessType processType) = _slotdataToParams(slot.slotdata);
+    uint8 newSlotdata = _paramsToSlotdata(true, true, processType);
+
+    slot.slotdata = newSlotdata;
+    dispute.arbitratorDisputeId = arbitratorDisputeId;
+    dispute.slotId = _slotId;
+    dispute.challenger = msg.sender;
+    dispute.state = DisputeState.Used;
+    dispute.currentRound = 0;
+
+    dispute.nContributions = 0;
+    dispute.pendingWithdraws[0] = 0;
+    dispute.pendingWithdraws[1] = 0;
+    dispute.appealDeadline = 0;
+    // you don't need to reset dispute.winningParty because it's not used until Withdrawing
+    // and to get to Withdrawing (in rule() function) you set the dispute.winningParty there
+    dispute.freeSpace2 = 1; // to make sure slot never cannot go to zero.
+
+    // initialize roundContributions of round: 1
+    // will be 5k in reused. but 20k in new.
+    RoundContributions storage roundContributions = roundContributionsMap[_disputeSlot][1];
+    roundContributions.filler = 1;
+    roundContributions.appealCost = 0;
+    roundContributions.partyTotal[0] = 0;
+    roundContributions.partyTotal[1] = 0;
+
+    emit RequestChallenged(_slotId, _disputeSlot);
+    // ERC 1497
+    // the evidenceGroupId is obtained from the slot of the challenged request
+    uint256 evidenceGroupId = uint256(keccak256(abi.encodePacked(_slotId, slot.requestTime)));
+    // metaEvidenceId is related to the processType (different for Add, Removal or Edit)
+    emit Dispute(arbitrator, arbitratorDisputeId, uint256(processType), evidenceGroupId);
+    emit Evidence(arbitrator, evidenceGroupId, msg.sender, _reason);
+  }
+
+  /** @dev Like challengeRequest but with frontrun protection.
+   *  @param _slotId The id of the slot containing the request to challenge.
+   *  @param _fromSlot The id of the disputeSlot that will checked first for availability.
+   *  It will create a dispute in the first available disputeSlot.
+   *  @param _reason The ipfs uri linking to a file describing the reason the request
+   *  must be rejected. If the request is incorrect, but not for the reason the challenger
+   *  is giving, then the dispute should fail.
+   */
+  function challengeRequestInFirstFreeSlot(
+    uint64 _slotId,
+    uint64 _fromSlot,
+    string calldata _reason
+  ) public payable {
+    uint64 disputeWorkSlot = _firstFreeDisputeSlot(_fromSlot);
+    challengeRequest(_slotId, disputeWorkSlot, _reason);
+  }
+
+  /** @dev Submit Evidence to any evidenceGroupId
+   *  @param _evidenceGroupId The evidenceGroupId the Evidence is submitted to.
+   *  @param _evidence The ipfs uri linking to the file that contains the evidence.
+   */
+  function submitEvidence(uint256 _evidenceGroupId, string calldata _evidence) external {
+    // you can just submit evidence directly to any _evidenceGroupId
+    emit Evidence(arbitrator, _evidenceGroupId, msg.sender, _evidence);
+  }
+
+  /** @dev Make a contribution towards the appeal of a dispute.
+   *  @param _disputeSlot The disputeSlot linked to the dispute the contribution is intended for.
+   *  @param _party The party this contribution is siding with. This will decide if this
+   *  contribution has a reward or not after the dispute is over.
+   */
+  function contribute(uint64 _disputeSlot, Party _party) public payable {
+    DisputeSlot storage dispute = disputes[_disputeSlot];
+    require(dispute.state == DisputeState.Used, "DisputeSlot has to be used");
+
+    _verifyUnderAppealDeadline(dispute);
+
+    dispute.nContributions++;
+    dispute.pendingWithdraws[uint256(_party)]++;
+    // compress amount, possibly losing up to 4 gwei. they will be burnt.
+    uint80 amount = _compressAmount(msg.value);
+    uint8 nextRound = dispute.currentRound + 1;
+    roundContributionsMap[_disputeSlot][nextRound].partyTotal[uint256(_party)] += amount;
+
+    // pendingWithdrawal = true, party = _party
+    uint8 contribdata = _paramsToContribdata(true, _party);
+    contributions[_disputeSlot][dispute.nContributions++] = Contribution({round: nextRound, contribdata: contribdata, contributor: msg.sender, amount: amount});
+    emit Contribute(_disputeSlot, nextRound, amount, _party);
+  }
+
+  /** @dev Appeal a dispute and start the next round. It will use the contributed funds.
+   *  @param _disputeSlot The disputeSlot linked to the dispute to be appealed.
+   */
+  function startNextRound(uint64 _disputeSlot) public {
+    DisputeSlot storage dispute = disputes[_disputeSlot];
+    uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
+    Slot storage slot = slots[dispute.slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
+    require(dispute.state == DisputeState.Used, "DisputeSlot has to be Used");
+
+    _verifyUnderAppealDeadline(dispute);
+
+    uint256 appealCost = arbitrator.appealCost(dispute.arbitratorDisputeId, settings.arbitratorExtraData);
+    uint256 totalAmountNeeded = (appealCost * settings.multiplier) / DIVIDER;
+
+    // make sure you have the required amount
+    uint256 currentAmount = _decompressAmount(roundContributionsMap[_disputeSlot][nextRound].partyTotal[0] + roundContributionsMap[_disputeSlot][nextRound].partyTotal[1]);
+    require(currentAmount >= totalAmountNeeded, "Not enough to fund round");
+
+    // got enough, it's legit to do so. I can appeal, lets appeal
+    arbitrator.appeal{value: appealCost}(dispute.arbitratorDisputeId, settings.arbitratorExtraData);
+
+    // remember the appeal cost, for sharing the spoils later
+    roundContributionsMap[_disputeSlot][nextRound].appealCost = _compressAmount(appealCost);
+
+    dispute.currentRound++;
+
+    // set the roundContributions of the upcoming round to zero.
+    RoundContributions storage roundContributions = roundContributionsMap[_disputeSlot][nextRound + 1];
+    roundContributions.appealCost = 0;
+    roundContributions.partyTotal[0] = 0;
+    roundContributions.partyTotal[1] = 0;
+    roundContributions.filler = 1; // to avoid getting whole storage slot to 0.
+
+    // this may not be needed, if the subgraph listens to the arbitrator
+    // done because optimizing ~500 gas in the appeal function is not a priority
+    emit NextRound(_disputeSlot);
+  }
+
+  /** @dev Give a ruling for a dispute. Can only be called by the arbitrator. TRUSTED.
+   *  @param _disputeId The arbitrator id of the dispute.
+   *  @param _ruling The ruling for the dispute.
+   */
+  function rule(uint256 _disputeId, uint256 _ruling) external override {
+    // arbitrator is trusted to:
+    // a. call this only once, after dispute is final
+    // b. not call this with an unknown _disputeId (it would affect the disputeSlot = 0)
+    require(msg.sender == address(arbitrator), "Only arbitrator can rule");
+    //1. get slot from dispute
+    uint64 disputeSlot = disputeIdToDisputeSlot[_disputeId];
+    DisputeSlot storage dispute = disputes[disputeSlot];
+    Slot storage slot = slots[dispute.slotId];
+    // 2. make sure that dispute has an ongoing dispute
+    require(dispute.state == DisputeState.Used, "Can only be executed if Used");
+    // 3. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
+    // default to requester, in that case.
+    // 0 refuse, 1 requester, 2 challenger.
+    if (_ruling == 1 || _ruling == 0) {
+      // requester won.
+      emit DisputeFailed(disputeSlot);
+      dispute.winningParty = Party.Requester;
+      // dispute.pendingInitialWithdraw stays at false, because challenger lost.
+      // 5a. reset timestamp for the request, it will go through the period again.
+      slot.requestTime = uint40(block.timestamp);
+      (, , ProcessType processType) = _slotdataToParams(slot.slotdata);
+      // used: true, disputed: false, ProcessType: processType
+      slot.slotdata = _paramsToSlotdata(true, false, processType);
+    } else {
+      // challenger won. emit disputeslot to update the status to Withdrawing in the subgraph
+      emit RequestRejected(dispute.slotId, disputeSlot);
+      dispute.winningParty = Party.Challenger;
+      // 5b. slot is now Free.. other slotdata doesn't matter.
+      // _paramsToSlotdata(false, false, ProcessType.Add) = 0
+      slot.slotdata = 0;
+
+      // now, award the requesterStake to challenger
+      Settings storage settings = settingsMap[slot.settingsId];
+      uint256 amount = _decompressAmount(settings.requesterStake);
+      // is it dangerous to send before the end of the function? please answer on audit
+      payable(dispute.challenger).send(amount);
     }
 
-    // settings cannot be mutated once created
-    struct Settings {
-        // you don't need to store created
-        uint requesterStake;
-        uint challengerStake;
-        uint40 requestPeriod;
-        uint40 fundingPeriod;
-        address arbitrator;
-        uint16 freeSpace;
-        //  store extraData?!?!
-    }
-    
-    struct List {
-        uint48 settingsId;
-        address governor; // governors can change governor of the list, and change settingsId
-        uint48 freeSpace;
-    }
-    
-    struct Slot {
-        uint8 slotdata; // holds "used", "processType" and "disputed", compressed in the same variable.
-        uint48 settingsId; // settings spam attack is highly unlikely (1M years of full 15M gas blocks)
-        uint40 requestTime; // overflow in 37k years
-        address requester;
-    }
-    
-    // all bounded data related to the Dispute. unbounded data such as contributions is handled out
-    // todo
-    struct Dispute {
-        // you could save 8 bits by just having "used" be nContributions == 0.
-        // and setting nContributions to zero when contribs are cashed out, so dispute slot is available.
-        // but there's no gas to save doing so (yet)
-        uint256 arbitratorDisputeId; // required
-        uint64 slotId; // flexible
-        address challenger; // store it here instead of contributions[dispute][0]
-        DisputeState state; 
-        uint8 currentRound;
-        uint24 freeSpace;
-        uint64 nContributions; // if 0, it means slot is unused.
-        uint40 timestamp; // to derive  
-        uint152 freeSpace2;
-    }
-    
-    struct Contribution {
-        uint8 round; // could be bigger, there's enough space by shifting amount.
-        Party party;
-        uint80 amount; // to be raised 32 bits.
-        address contributor; // could be compressed to 64 bits, but there's no point.
+    dispute.state = DisputeState.Withdrawing;
+    emit Ruling(arbitrator, _disputeId, _ruling);
+  }
+
+  /** @dev Withdraw a single contribution from an appeal, if elegible for a reward.
+   * @param _disputeSlot The disputeSlot the contribution was made for.
+   * @param _contributionSlot The slot in which the contribution was stored.
+   */
+  function withdrawOneContribution(uint64 _disputeSlot, uint64 _contributionSlot) public {
+    // check if dispute is used.
+    DisputeSlot storage dispute = disputes[_disputeSlot];
+    require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
+    require(dispute.nContributions > _contributionSlot, "DisputeSlot lacks that contrib");
+
+    Contribution storage contribution = contributions[_disputeSlot][_contributionSlot];
+    (bool pendingWithdrawal, Party party) = _contribdataToParams(contribution.contribdata);
+
+    require(pendingWithdrawal, "Contribution withdrawn already");
+
+    // okay, all checked. let's get the contribution.
+
+    RoundContributions memory roundContributions = roundContributionsMap[_disputeSlot][contribution.round];
+    Party winningParty = dispute.winningParty;
+
+    if (roundContributions.appealCost != 0) {
+      // then this is a contribution from an appealed round.
+      // only winner party can withdraw.
+      require(party == winningParty, "That side lost the dispute");
+
+      _withdrawSingleReward(contribution, roundContributions, party);
+    } else {
+      // this is a contrib from a round that didnt get appealed.
+      // just refund the same amount
+      uint256 refund = _decompressAmount(contribution.amount);
+      payable(contribution.contributor).transfer(refund);
     }
 
-    struct StoredRuling {
-        uint ruling;
-        bool ruled; // this bit costs 20k gas
+    if (dispute.pendingWithdraws[uint256(winningParty)] == 1) {
+      // this was last contrib remaining
+      // no need to decrement pendingWithdraws if last. saves gas.
+      dispute.state = DisputeState.Free;
+      emit FreedDisputeSlot(_disputeSlot);
+    } else {
+      dispute.pendingWithdraws[uint256(winningParty)]--;
+      // set contribution as withdrawn. party doesn't matter, so it's chosen as Party.Requester
+      // (pendingWithdrawal = false, party = Party.Requester) => paramsToContribution(false, Party.Requester) = 0
+      contribution.contribdata = 0;
+      emit WithdrawnContribution(_disputeSlot, _contributionSlot);
     }
-    
-    // EVENTS //
-    
-    event ListCreated(uint64 _listIndex, uint48 _settingsId, address _governor, string _ipfsUri);
-    event ListUpdated(uint64 _listIndex, uint48 _settingsId, address _governor);
-    event SettingsCreated(uint _requestPeriod, uint _requesterStake, uint _challengerStake);
-    event ItemAddRequest(uint64 _listIndex, uint64 _slotIndex, string _ipfsUri);
-    event ItemAdded(uint64 _slotIndex);
-    event ItemRemovalRequest(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime);
-    event ItemRemoved(uint64 _slotIndex);
-    
-    
-    // CONTRACT STORAGE //
-    uint64 listCount;
-    uint48 settingsCount; // to prevent from assigning invalid settings to lists.
+  }
 
-    mapping(uint64 => Slot) slots;
-    mapping(uint64 => Dispute) disputes;
-    mapping(uint64 => List) lists;
-    // a spam attack would take ~1M years of filled mainnet blocks to deplete settings id space.
-    mapping(uint48 => Settings) settingsMap;
-    mapping(uint256 => mapping(uint64 => Contribution)) contributions; // contributions[disputeSlot][n]
-    mapping(address => mapping(uint256 => StoredRuling)) storedRulings; // storedRulings[arbitrator][disputeId]
-    
-    constructor() {
-    }
-    
-    // PUBLIC FUNCTIONS
-    
-    // lists
-    function createList(address _governor, uint48 _settingsId, string memory _ipfsUri) public {
-        require(_settingsId < settingsCount, "Settings must exist");
-        List storage list = lists[listCount++];
-        list.governor = _governor;
-        list.settingsId = _settingsId;
-        emit ListCreated(listCount - 1, _settingsId, _governor, _ipfsUri);
-    }
+  /** @dev Withdraws all contributions and the initial stake, and sets the disputeSlot Free.
+   *  @param _disputeSlot The target disputeSlot.
+   */
+  function withdrawAllContributions(uint64 _disputeSlot) public {
+    // this func is a "public good". it uses less gas overall to withdraw all
+    // contribs. because you only need to change 1 single flag to free the dispute slot.
 
-    function updateList(uint64 _listIndex, uint48 _settingsId, address _newGovernor) public {
-        List storage list = lists[_listIndex];
-        require(msg.sender == list.governor, "You need to be the governor");
-        list.governor = _newGovernor;
-        list.settingsId = _settingsId;
-        emit ListUpdated(_listIndex, _settingsId, _newGovernor);
-    }
+    DisputeSlot storage dispute = disputes[_disputeSlot];
+    require(dispute.state == DisputeState.Withdrawing, "DisputeSlot must be in withdraw");
 
-    // settings
-    // bit of a draft since I havent done the dispute side of things yet
-    function createSettings(uint _requesterStake, uint _challengerStake, uint40 _requestPeriod, uint40 _fundingPeriod) public {
-        // put safeguard check? for checking if settingsCount is -1.
-        require(settingsCount != 4294967295, "Max settings reached"); // there'd be 4.3B so please just reuse one
-        Settings storage settings = settingsMap[settingsCount++];
-        settings.requesterStake = _requesterStake;
-        settings.challengerStake = _challengerStake;
-        settings.requestPeriod = _requestPeriod;
-        settings.fundingPeriod = _fundingPeriod;
-        emit SettingsCreated(_requestPeriod, _requesterStake, _challengerStake);
-    }
-    
-    // no refunds for overpaying. consider it burned. refunds are bloat.
+    Party winningParty = dispute.winningParty;
+    // this is due to how contribdata is encoded. the variable name is self-explanatory.
+    uint8 pendingAndWinnerContribdata = 128 + 64 * uint8(winningParty);
 
-    // you could add an "emergency" boolean option.
-    // if on, and the chosen slotIndex is taken, it will look for the first unused slot and create there instead.
-    // otherwise, the transaction fails. it's important to have it optional this since there could potentially be a lot of
-    // taken slots.
-    // but its important to have to option as safeguard in case frontrunners try to inhibit the protocol.
-    // another way is making a separate wrapper public function for this, that calls the two main ones
-    // (make one for add and another for remove. and another one for challenging (to get free dispute slot))
+    // there are two types of contribs that are handled differently:
+    // 1. the contributions of appealed rounds.
+    uint64 contribSlot = 0;
+    uint8 currentRound = 1;
+    RoundContributions memory roundContributions = roundContributionsMap[_disputeSlot][currentRound];
+    while (contribSlot < dispute.nContributions) {
+      Contribution memory contribution = contributions[_disputeSlot][contribSlot];
+      // update the round
+      if (contribution.round != currentRound) {
+        roundContributions = roundContributionsMap[_disputeSlot][contribution.round];
+        currentRound = contribution.round;
+      }
 
-    // in the contract, listIndex and settingsId are trusted.
-    // but in the subgraph, if listIndex doesnt exist or settings are not really the ones on list
-    // then item will be ignored or marked as invalid.
-    function addItem(uint64 _listIndex, uint48 _settingsId, uint64 _slotIndex, string memory _ipfsUri) public payable {
-        Slot storage slot = slots[_slotIndex];
-        (bool used,,) = slotdataToParams(slot.slotdata);
-        require(used == false, "Slot must not be in use");
-        Settings storage settings = settingsMap[_settingsId];
-        require(msg.value >= settings.requesterStake, "This is not enough to cover initil stake");
-        // used: false, processType: Add, disputed: false
-        uint8 slotdata = paramsToSlotdata(false, ProcessType.Add, false);
-        slot.slotdata = slotdata;
-        slot.requestTime = uint40(block.timestamp);
-        slot.requester = msg.sender;
-        slot.settingsId = _settingsId;
-        emit ItemAddRequest(_listIndex, _slotIndex, _ipfsUri);
-    }
-    
-    // list is checked in subgraph. settings is trusted here.
-    // if settings was not the one settings in subgraph at the time,
-    // then subgraph will ignore the removal (so it has no effect when exec.)
-    // could even be challenged as an ilegal request to extract the stake, if significant.
-    function removeItem(uint64 _workSlot, uint48 _settingsId, uint64 _idSlot, uint40 _idRequestTime) public payable {
-        Slot storage slot = slots[_workSlot];
-        (bool used,,) = slotdataToParams(slot.slotdata);
-        require(used == false, "Slot must not be in use");
-        Settings storage settings = settingsMap[_settingsId];
-        require(msg.value >= settings.requesterStake, "This is not enough to cover requester stake");
-        // used: false, processType: Add, disputed: false
-        uint8 slotdata = paramsToSlotdata(false, ProcessType.Removal, false);
-        slot.slotdata = slotdata;
-        slot.requestTime = uint40(block.timestamp);
-        slot.requester = msg.sender;
-        slot.settingsId = _settingsId;
-        emit ItemRemovalRequest(_workSlot, _settingsId, _idSlot, _idRequestTime);
-    }
-    
-    function executeRequest(uint64 _slotIndex) public {
-        Slot storage slot = slots[_slotIndex];
-        require(slotIsExecutable(slot), "Slot cannot be executed");
-        (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
-        Settings storage settings = settingsMap[slot.settingsId];
-        payable(slot.requester).transfer(settings.requesterStake);
-        if (processType == ProcessType.Add) {
-            emit ItemAdded(_slotIndex);
-        }
-        else {
-            emit ItemRemoved(_slotIndex);
-        }
-        // used to false, others don't matter.
-        slot.slotdata = paramsToSlotdata(false, ProcessType.Add, false);
+      if (currentRound > dispute.currentRound) break; // see next loop.
+
+      if (contribution.contribdata == pendingAndWinnerContribdata) {
+        _withdrawSingleReward(contribution, roundContributions, winningParty);
+      }
+      contribSlot++;
     }
 
-    function challengeRequest(uint64 _slotIndex, uint64 _disputeSlot) public payable {
-        Slot storage slot = slots[_slotIndex];
-        require(slotCanBeChallenged(slot), "Slot cannot be challenged");
-        Settings storage settings = settingsMap[slot.settingsId];
-        require(msg.value >= settings.challengerStake, "This is not enough to cover challenger stake");
-        // TODO you need to check if the submission time has passed. because then, challenger cannot challenge
-        // someone needs to execute the process.
-        Dispute storage dispute = disputes[_disputeSlot];
-        require(dispute.state == DisputeState.Free, "That dispute slot is being used");
-
-        // it will be challenged now
-
-        // arbitrator magic happens here (pay fees, maybe read how much juror fees are...)
-        // and get disputeId so that you can store it, you know.
-        // we try to create the dispute first, then update values here.
-
-        //  weird edge cases:
-        // with juror fees increasing, and item is quickly requested
-        // before list settings are updated.
-        // the item might not have enough in stake to pay juror fees, and this
-        // would always fail. not sure how to proceed, then.
-        // i wouldn't trust an arbitrator that can pull that off.
-
-        (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
-        uint8 newSlotdata = paramsToSlotdata(true, processType, true);
-
-        slot.slotdata = newSlotdata;
-        dispute.state = DisputeState.Ruling;
-        dispute.nContributions = 0;
-        dispute.slotId = _slotIndex;
-        // round is 0, amount is in dispute.slotId -> slot.settings -> settings.challengerStake, party is challenger
-        // so it's a waste to create a contrib. just integrate it with dispute slot.
-        dispute.challenger = msg.sender;
+    // 2. the contributions of the last, unappealed round.
+    while (contribSlot < dispute.nContributions) {
+      // refund every transaction
+      Contribution memory contribution = contributions[_disputeSlot][contribSlot];
+      _refundContribution(contribution);
+      contribSlot++;
     }
+    // afterwards, set the dispute slot Free.
+    dispute.state = DisputeState.Free;
+    emit FreedDisputeSlot(_disputeSlot);
+  }
 
-    function contribute(uint64 _disputeSlot, Party _party) public payable {
-        Dispute storage dispute = disputes[_disputeSlot];
-        require(dispute.state == DisputeState.Funding, "Dispute is not in funding state");
-        // compress amount, possibly losing up to 4 gwei. they will be burnt.
-        uint80 amount = uint80(msg.value >> AMOUNT_BITSHIFT);
-        contributions[_disputeSlot][dispute.nContributions++] = Contribution({
-            round: dispute.currentRound + 1,
-            party: _party,
-            contributor: msg.sender,
-            amount: amount
-        });
-    }
+  // PRIVATE FUNCTIONS
 
-    function startNextRound(uint64 _disputeSlot, uint64 _firstContributionForRound) public {
-        Dispute storage dispute = disputes[_disputeSlot];
-        uint8 nextRound = dispute.currentRound + 1; // to save gas with less storage reads
-        require(dispute.state == DisputeState.Funding, "Dispute has to be on Funding");
-        Contribution memory firstContribution = contributions[_disputeSlot][_firstContributionForRound];
-        require(nextRound == firstContribution.round, "This contribution is for another round");
-        // get required fees from somewhere. how? is it expensive? do I just calculate here?
-        // look into this later. for now just make the total amount up.
-        uint80 totalAmountNeeded = 3000;
-        uint80 sumOfAmounts = firstContribution.amount;
-        uint64 i = _firstContributionForRound;
-        bool successFlag = false;
-        for (;; i++) {
-            Contribution storage contribution = contributions[_disputeSlot][i];
-            // break if round changes.
-            // actually theres a better way to do this. fix this abomination.
-            // you dont need to check round, you could just do the for until
-            // you run out of nContributions
-            // because you cannot bullshit the rounds anyway
-            // no one can make a contribution with the wrong round.
-            // todo
-            if (nextRound != contribution.round) {
-                break;
-            }
-            sumOfAmounts = sumOfAmounts + contribution.amount;
-            // break if needed sum is reached
-            if (sumOfAmounts >= totalAmountNeeded) {
-                successFlag = true;
-                break;
-            }
-        }
-        require(successFlag, "Insufficient amount");
-        uint actualAmount = totalAmountNeeded << uint80(AMOUNT_BITSHIFT);
-        // something is done with the actual amount
-        // its divided by something or whatever and you get the fees
-        // or maybe you already know, and read from settings or a view func.
-        // bs event to make VS Code shut up. TODO.
-        emit ItemAdded(uint64(actualAmount));
-        // and then you call the function of the arbitrator with value equal to "actualAmount"
-        // plus a few gwei, because we're may be losing to rounding errors.
-        // or we could make contributors pay slightly more gwei just to always be on the safe side.
+  /** @dev Called when dispute.appealDeadline is over block.timestamp.
+   *  Will check arbitrator deadline, and revert if period is over.
+   *  This is to read it from storage instead of calling an external function.
+   *  @param _dispute The dispute that is verified.
+   */
+  function _verifyUnderAppealDeadline(DisputeSlot storage _dispute) private {
+    if (block.timestamp >= _dispute.appealDeadline) {
+      // you're over it. get updated appealPeriod
+      (, uint256 end) = arbitrator.appealPeriod(_dispute.arbitratorDisputeId);
+      require(block.timestamp < end, "Over submision period");
+      _dispute.appealDeadline = uint40(end);
+    }
+  }
 
-    }
+  /** @dev Withdraws a contribution as a reward.
+   *  @param _contribution The contribution to be withdrawn.
+   *  @param _roundContributions The contributions of the round to figure out the reward.
+   *  @param _winningParty The party that won the dispute.
+   */
+  function _withdrawSingleReward(
+    Contribution memory _contribution,
+    RoundContributions memory _roundContributions,
+    Party _winningParty
+  ) private {
+    uint256 spoils = _decompressAmount(_roundContributions.partyTotal[0] + _roundContributions.partyTotal[1] - _roundContributions.appealCost);
+    uint256 share = (spoils * uint256(_contribution.amount)) / uint256(_roundContributions.partyTotal[uint256(_winningParty)]);
+    // should use transfer instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
+    // if a transaction reverts due to not enough gas, does the send() ether remain sent? if that's so,
+    // it would break withdrawAllContributions as currently designed,
+    // and for single withdraws, then sending the ether will have to be the very last thing that occurs
+    // after all the flags have been modified.
+    payable(_contribution.contributor).send(share);
+  }
 
-    function executeRuling(uint64 _disputeSlot) public {
-        //1. get arbitrator for that setting, and disputeId from disputeSlot.
-        Dispute storage dispute = disputes[_disputeSlot];
-        Slot storage slot = slots[dispute.slotId];
-        Settings storage settings = settingsMap[slot.settingsId];
-        //   2. make sure that disputeSlot has an ongoing dispute
-        require(dispute.state == DisputeState.Funding, "Dispute can only be executed in Funding state");
-        //    3. access storedRulings[arbitrator][disputeId]. make sure it's ruled.
-        StoredRuling memory storedRuling = storedRulings[settings.arbitrator][dispute.arbitratorDisputeId];
-        require(storedRuling.ruled, "This wasn't ruled by the designated arbitrator");
-        //    4. apply ruling. what to do when refuse to arbitrate? dunno. maybe... just
-        //    default to requester, in that case.
-        // 0 refuse, 1 requester, 2 challenger.
-        (, ProcessType processType, ) = slotdataToParams(slot.slotdata);
-        if(storedRuling.ruling == 1 || storedRuling.ruling == 0) {
-            // requester won.
-            if(processType == ProcessType.Add) {
-                emit ItemAdded(dispute.slotId);
-            } else {
-                emit ItemRemoved(dispute.slotId);
-            }
-        } else {
-            // challenger won.
-            if(processType == ProcessType.Add) {
-                emit ItemRemoved(dispute.slotId);
-            } else {
-                emit ItemAdded(dispute.slotId);
-            }
-        }
-        // 5. withdraw rewards
-        withdrawRewards(_disputeSlot);
-        // 6. dispute and slot are now Free.
-        slot.slotdata = paramsToSlotdata(false, ProcessType.Add, false);
-        dispute.state = DisputeState.Free; // to avoid someone withdrawing rewards twice.
-    }
+  /** @dev Refunds a contribution when the round for that contribution wasn't appealed.
+   *  @param _contribution The contribution to refund.
+   */
+  function _refundContribution(Contribution memory _contribution) private {
+    uint256 refund = _decompressAmount(_contribution.amount);
+    // should use send instead? if transfer fails, then disputeSlot will stay in DisputeState.Withdrawing
+    // if a transaction reverts due to not enough gas, does the send() ether remain sent?
+    payable(_contribution.contributor).transfer(refund);
+  }
 
-    // rule:
-    function rule(uint _disputeId, uint _ruling) external {
-        storedRulings[msg.sender][_disputeId] = StoredRuling({
-            ruling: _ruling,
-            ruled: true
-        });
-    }
+  // VIEW FUNCTIONS
 
-    function withdrawRewards(uint64 _disputeSlot) private {
-        // todo
+  // These three public view functions, I don't think they're necessary to have them here.
+  // You can get the arbitrator and make a query to check this directly in the frontend,
+  // all the needed data to make these queries is in the subgraph.
+  // Give me your opinion on removing them.
 
-        /*
-            withdraw rewards
-            ok whats the deal with this
-            do arbitrator remember the fees they have for each dispute? is it different for each dispute?
-            because this is pretty important actually
-            if it doesn't remember, even if I query for fees every single time (which is super inefficient)
-            I would be fucked up
+  /** @dev Check the challenge fee a challenger would incur if challenging a request.
+   *  @param _slotId The id of the slot.
+   *  @return The arbitration fee to challenge a request.
+   */
+  function challengeFee(uint64 _slotId) public view returns (uint256) {
+    Slot storage slot = slots[_slotId];
+    Settings storage settings = settingsMap[slot.settingsId];
 
-            if they remember, you'd need to ask for fees:
-            - when challenging
-            - when withdrawing rewards, to substract the total cost of the dispute.
-            (or, you could store the total cost somewhere in the dispute data.)
-            - when advancing to next round.
+    return (arbitrator.arbitrationCost(settings.arbitratorExtraData));
+  }
 
-            edge case:
-            some settings don't work anymore
-            because arbitrator changes fees while there's a submitted item
-            and the submitter stake and challenger stake no longer cover the dispute, so it cannot start.
-            in that case, we could revert and make it impossible to challenge. e.g. let submitter
-            just pick up their reward. someone can create new settings, edit
-            the settings of the list and then remove the item, so there's a workaround.
-        */
-    }
-    
-    
-    // VIEW FUNCTIONS
-    
-    // relying on this by itself could result on users colliding on same slot
-    // user which is late will have the transaction cancelled, but gas wasted and unhappy ux
-    // could be used to make an "emergency slot", in case your slot submission was in an used slot.
-    // will get the first Virgin, or Created slot.
-    function firstFreeSlot(uint64 _startPoint) view public returns (uint64) {
-        uint64 i = _startPoint;
-        // this is used == true, because if used, slotdata is of shape 1xx00000, so it's larger than 127
-        while (slots[i].slotdata > 127) {
-            i = i + 1;
-        }
-        return i;
-    }
-    
-    // debugging purposes, for now. shouldn't be too expensive and could be useful in future, tho
-    // doesn't actually "count" the slots, just checks until there's a virgin slot
-    // it's the same as "maxSlots" in the notes
-    function firstVirginSlotFrom(uint64 _startPoint) view public returns (uint64) {
-        uint64 i = _startPoint;
-        while (slots[i].requester != address(0)){
-            i = i + 1;
-        }
-        return i;
-    }
-    
-    // this is prob bloat. based on the idea of generating a random free slot, to avoid collisions.
-    // could be used to advice the users to wait until there's free slot for gas savings.
-    function countFreeSlots() view public returns (uint64) {
-        uint64 slotCount = firstVirginSlotFrom(0);
-        uint64 i = 0;
-        uint64 freeSlots = 0;
-        for (; i < slotCount; i++) {
-            Slot storage slot = slots[i];
-            // !slot.used ; so slotdata is smaller than 128
-            if (slot.slotdata < 128) {
-                freeSlots++;
-            }
-        }
-        return freeSlots;
-    }
-    
-    function viewSlot(uint64 _slotIndex) view public returns (Slot memory) {
-        return slots[_slotIndex];
-    }
-    
-    function slotIsExecutable(Slot memory _slot) view public returns (bool) {
-        Settings storage settings = settingsMap[_slot.settingsId];
-        bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
-        (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
-        return used && overRequestPeriod && !disputed;
-    }
-    
-    function slotCanBeChallenged(Slot memory _slot) view public returns (bool) {
-        Settings storage settings = settingsMap[_slot.settingsId];
-        bool overRequestPeriod = block.timestamp > _slot.requestTime + settings.requestPeriod;
-        (bool used, , bool disputed) = slotdataToParams(_slot.slotdata);
-        return used && !overRequestPeriod && !disputed;
-    }
+  /** @dev Get the cost of making an appeal for a dispute.
+   *  @param _disputeSlot The slot containing the dispute.
+   *  @return The cost of appealing the dispute.
+   */
+  function appealCost(uint64 _disputeSlot) public view returns (uint256) {
+    DisputeSlot memory disputeSlot = disputes[_disputeSlot];
+    Slot memory slot = slots[disputeSlot.slotId];
+    Settings memory settings = settingsMap[slot.settingsId];
+    return (arbitrator.appealCost(disputeSlot.arbitratorDisputeId, settings.arbitratorExtraData));
+  }
 
-    // returns "slotdata" given parameters such as
-    // used, processType and disputed, in a single encoded uint8.
-    // TODO adapt for edit ProcessType (2 bits now)
-    function paramsToSlotdata(bool _used, ProcessType _processType, bool _disputed) public pure returns (uint8) {
-        uint8 usedAddend;
-        if (_used) usedAddend = 128;
-        uint8 processTypeAddend;
-        if (_processType == ProcessType.Removal) processTypeAddend = 64;
-        uint8 disputedAddend;
-        if (_disputed) disputedAddend = 32;
-        uint8 slotdata = usedAddend + processTypeAddend + disputedAddend;
-        return slotdata;
-    }
+  /** @dev Get the appeal period of making an appeal for a dispute.
+   *  @param _disputeSlot The slot containing the dispute.
+   *  @return (start, end) the two instants of time you can appeal a dispute.
+   */
+  function appealPeriod(uint64 _disputeSlot) public view returns (uint256, uint256) {
+    DisputeSlot memory disputeSlot = disputes[_disputeSlot];
+    return (arbitrator.appealPeriod(disputeSlot.arbitratorDisputeId));
+  }
 
-    // returns a tuple with these three from a given slotdata
-    function slotdataToParams(uint8 _slotdata) public pure returns (bool, ProcessType, bool) {
-        uint8 usedAddend = _slotdata & 128;
-        bool used = usedAddend != 0;
-        uint8 processTypeAddend = _slotdata & 64;
-        ProcessType processType = ProcessType(processTypeAddend >> 6);
-        uint8 disputedAddend = _slotdata & 32;
-        bool disputed = disputedAddend != 0;
-        return (used, processType, disputed);
+  // From here, all view functions are internal.
+
+  /** @dev Get the first free request slot from a given point.
+   *  Relying on this in the frontend could result in collisions.
+   *  This view function is used for the frontrun protection request functions.
+   *  @param _startPoint The point from which you start looking for a free slot.
+   *  @return The first free request slot from the starting point.
+   */
+  function _firstFreeSlot(uint64 _startPoint) internal view returns (uint64) {
+    uint64 i = _startPoint;
+    // this is used == true, because if used, slotdata is of shape 1xxx0000, so it's larger than 127
+    while (slots[i].slotdata > 127) {
+      i++;
     }
+    return i;
+  }
+
+  /** @dev Get the first free dispute slot from a given point.
+   *  Relying on this in the frontend could result in collisions.
+   *  This view function is used for the frontrun protection request functions.
+   *  @param _startPoint The point from which you start looking for a free slot.
+   *  @return The first free dispute slot from the starting point.
+   */
+  function _firstFreeDisputeSlot(uint64 _startPoint) internal view returns (uint64) {
+    uint64 i = _startPoint;
+    while (disputes[i].state == DisputeState.Used) {
+      i++;
+    }
+    return i;
+  }
+
+  /** @dev Check if a slot can be executed.
+   *  @param _slot The slot to check.
+   *  @param _requestPeriod The period the request has to last to be executable.
+   *  @return True if the slot can be executed, false otherwise.
+   */
+  function _slotIsExecutable(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
+    (bool used, bool disputed, ) = _slotdataToParams(_slot.slotdata);
+    return used && (block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
+  }
+
+  /** @dev Check if a slot can be challenged.
+   *  @param _slot The slot to check.
+   *  @param _requestPeriod The period the request has to last to be executable.
+   *  @return True if the slot can be executed, false otherwise.
+   */
+  function _slotCanBeChallenged(Slot memory _slot, uint40 _requestPeriod) internal view returns (bool) {
+    (bool used, bool disputed, ) = _slotdataToParams(_slot.slotdata);
+    return used && !(block.timestamp > _slot.requestTime + _requestPeriod) && !disputed;
+  }
+
+  /** @dev Compress slot request variables for storage.
+   *  @param _used The usage status of the slot.
+   *  @param _disputed The disputed status of the slot.
+   *  @param _processType The type of request contained in the slot (add, removal, edit)
+   *  @return The compressed data.
+   */
+  function _paramsToSlotdata(
+    bool _used,
+    bool _disputed, // you store disputed to stop someone from calling executeRequest
+    ProcessType _processType
+  ) internal pure returns (uint8) {
+    uint8 usedAddend;
+    if (_used) usedAddend = 128;
+    uint8 disputedAddend;
+    if (_disputed) disputedAddend = 64;
+    uint8 processTypeAddend;
+    if (_processType == ProcessType.Removal) processTypeAddend = 16;
+    if (_processType == ProcessType.Edit) processTypeAddend = 32;
+    uint8 slotdata = usedAddend + processTypeAddend + disputedAddend;
+    return slotdata;
+  }
+
+  /** @dev Decompress slotdata to its variables.
+   *  @param _slotdata The slotdata to decompress.
+   *  @return (used, disputed, processType), the decompressed variables of the slotdata.
+   */
+  function _slotdataToParams(uint8 _slotdata)
+    internal
+    pure
+    returns (
+      bool,
+      bool,
+      ProcessType
+    )
+  {
+    uint8 usedAddend = _slotdata & 128;
+    bool used = usedAddend != 0;
+    uint8 disputedAddend = _slotdata & 64;
+    bool disputed = disputedAddend != 0;
+
+    uint8 processTypeAddend = _slotdata & 48;
+    ProcessType processType = ProcessType(processTypeAddend >> 4);
+
+    return (used, disputed, processType);
+  }
+
+  /** @dev Compress contribution variables for storage.
+   *  @param _pendingWithdrawal The status of withdrawal of the contribution.
+   *  @param _party The party supported by the contribution.
+   *  @return The compressed data.
+   */
+  function _paramsToContribdata(bool _pendingWithdrawal, Party _party) internal pure returns (uint8) {
+    uint8 pendingWithdrawalAddend;
+    if (_pendingWithdrawal) pendingWithdrawalAddend = 128;
+    uint8 partyAddend;
+    if (_party == Party.Challenger) partyAddend = 64;
+
+    uint8 contribdata = pendingWithdrawalAddend + partyAddend;
+    return contribdata;
+  }
+
+  /** @dev Decompress contribdata to its variables.
+   *  @param _contribdata The contribdata to decompress.
+   *  @return (pendingWithdrawal, party), the decompressed variables of the contribdata.
+   */
+  function _contribdataToParams(uint8 _contribdata) internal pure returns (bool, Party) {
+    uint8 pendingWithdrawalAddend = _contribdata & 128;
+    bool pendingWithdrawal = pendingWithdrawalAddend != 0;
+    uint8 partyAddend = _contribdata & 64;
+    Party party = Party(partyAddend >> 6);
+
+    return (pendingWithdrawal, party);
+  }
+
+  // always compress / decompress rounding down.
+  /** @dev Compress an amount by shifting its bits to the right.
+   *  @param _amount The uint256 version of the amount.
+   *  @return The uint80 compressed version of the amount.
+   */
+  function _compressAmount(uint256 _amount) internal pure returns (uint80) {
+    return (uint80(_amount >> AMOUNT_BITSHIFT));
+  }
+
+  /** @dev Decompress an amount by shifting its bits to the left
+   *  @param _compressedAmount The uint80 compressed version of the amount.
+   *  @return The uint256 version of the amount, losing its 32 less significant bits, up to 4 gwei.
+   */
+  function _decompressAmount(uint80 _compressedAmount) internal pure returns (uint256) {
+    return (uint256(_compressedAmount) << AMOUNT_BITSHIFT);
+  }
 }
